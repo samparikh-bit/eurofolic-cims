@@ -1,22 +1,32 @@
 import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell, LabelList, PieChart, Pie } from 'recharts';
-import { Plus, Package, LogOut } from 'lucide-react';
+import { Plus, Package, LogOut, Database, AlertCircle, RefreshCw } from 'lucide-react';
+import { supabase, isSupabaseConfigured } from './supabaseClient';
 
 const SIZES = ['5ml', '10ml', '100ml'];
 const VIALS_PER_PACK = { '5ml': 5, '10ml': 5, '100ml': 1 };
+const COUNTRIES = ['Afghanistan','Albania','Algeria','Argentina','Australia','Austria','Bangladesh','Belgium','Brazil','Canada','Chile','China','Colombia','Czech Republic','Denmark','Egypt','Finland','France','Germany','Ghana','Greece','Hungary','India','Indonesia','Iran','Iraq','Ireland','Israel','Italy','Japan','Kenya','Malaysia','Mexico','Morocco','Netherlands','New Zealand','Nigeria','Norway','Pakistan','Peru','Philippines','Poland','Portugal','Romania','Russia','Saudi Arabia','Singapore','South Africa','South Korea','Spain','Sweden','Switzerland','Thailand','Turkey','Ukraine','United Arab Emirates','United Kingdom','United States','Vietnam'];
 
-// In-memory storage for artifact environment
-const memoryStorage = {};
-const storage = {
-  async get(key) {
-    return memoryStorage[key] ? { value: memoryStorage[key] } : null;
-  },
-  async set(key, value) {
-    memoryStorage[key] = value;
-  },
-  async delete(key) {
-    delete memoryStorage[key];
-  }
+// Helper function to convert snake_case to camelCase
+const toCamelCase = (obj) => {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(toCamelCase);
+  return Object.keys(obj).reduce((acc, key) => {
+    const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+    acc[camelKey] = toCamelCase(obj[key]);
+    return acc;
+  }, {});
+};
+
+// Helper function to convert camelCase to snake_case
+const toSnakeCase = (obj) => {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(toSnakeCase);
+  return Object.keys(obj).reduce((acc, key) => {
+    const snakeKey = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+    acc[snakeKey] = toSnakeCase(obj[key]);
+    return acc;
+  }, {});
 };
 
 const AuditTag = ({ createdBy, createdAt }) => {
@@ -35,6 +45,18 @@ const AuditTag = ({ createdBy, createdAt }) => {
   );
 };
 
+const ConnectionStatus = ({ isConnected, onRetry }) => (
+  <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs ${isConnected ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+    <Database className="w-3 h-3" />
+    {isConnected ? 'Connected to Supabase' : 'Offline Mode'}
+    {!isConnected && (
+      <button onClick={onRetry} className="ml-1 hover:text-red-600">
+        <RefreshCw className="w-3 h-3" />
+      </button>
+    )}
+  </div>
+);
+
 const App = () => {
   const [currentUser, setCurrentUser] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -47,214 +69,451 @@ const App = () => {
   const [stockHolds, setStockHolds] = useState([]);
   const [stockAdjustments, setStockAdjustments] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [dbConnected, setDbConnected] = useState(false);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
-    checkLogin();
-    loadAllData();
+    initializeApp();
   }, []);
+
+  const initializeApp = async () => {
+    try {
+      // Check Supabase connection
+      if (isSupabaseConfigured()) {
+        const { error } = await supabase.from('users').select('id').limit(1);
+        if (!error) {
+          setDbConnected(true);
+          await checkLogin();
+          await loadAllData();
+        } else {
+          console.error('Supabase connection error:', error);
+          setDbConnected(false);
+        }
+      } else {
+        setDbConnected(false);
+        setError('Supabase not configured. Please add your credentials to supabaseClient.js');
+      }
+    } catch (e) {
+      console.error('Initialization error:', e);
+      setDbConnected(false);
+    }
+    setLoading(false);
+  };
 
   const checkLogin = async () => {
     try {
-      const sessionData = await storage.get('current-session');
-      if (sessionData) setCurrentUser(JSON.parse(sessionData.value));
-    } catch (e) { console.log('No session'); }
+      // Check localStorage for session
+      const sessionStr = localStorage.getItem('eurofolic-session');
+      if (sessionStr) {
+        const session = JSON.parse(sessionStr);
+        // Verify user still exists in database
+        const { data } = await supabase
+          .from('users')
+          .select('*')
+          .eq('id', session.id)
+          .single();
+        if (data) {
+          setCurrentUser(session);
+        } else {
+          localStorage.removeItem('eurofolic-session');
+        }
+      }
+    } catch (e) {
+      console.log('No session found');
+    }
   };
 
   const loadAllData = async () => {
     try {
-      const [salesData, purchasesData, customersData, suppliersData, pipelineData, stockHoldsData, stockAdjustmentsData] = await Promise.all([
-        storage.get('sales-data').catch(() => null),
-        storage.get('purchases-data').catch(() => null),
-        storage.get('customers-data').catch(() => null),
-        storage.get('suppliers-data').catch(() => null),
-        storage.get('pipeline-purchases-data').catch(() => null),
-        storage.get('stock-holds-data').catch(() => null),
-        storage.get('stock-adjustments-data').catch(() => null)
+      const [
+        { data: salesData },
+        { data: purchasesData },
+        { data: customersData },
+        { data: suppliersData },
+        { data: pipelineData },
+        { data: stockHoldsData },
+        { data: stockAdjustmentsData }
+      ] = await Promise.all([
+        supabase.from('sales').select('*').order('created_at', { ascending: false }),
+        supabase.from('purchases').select('*').order('created_at', { ascending: false }),
+        supabase.from('customers').select('*').order('name'),
+        supabase.from('suppliers').select('*').order('name'),
+        supabase.from('pipeline_purchases').select('*').order('expected_date'),
+        supabase.from('stock_holds').select('*').order('created_at', { ascending: false }),
+        supabase.from('stock_adjustments').select('*').order('created_at', { ascending: false })
       ]);
-      if (salesData) setSales(JSON.parse(salesData.value));
-      if (purchasesData) setPurchases(JSON.parse(purchasesData.value));
-      if (customersData) setCustomers(JSON.parse(customersData.value));
-      if (suppliersData) setSuppliers(JSON.parse(suppliersData.value));
-      if (pipelineData) setPipelinePurchases(JSON.parse(pipelineData.value));
-      if (stockHoldsData) setStockHolds(JSON.parse(stockHoldsData.value));
-      if (stockAdjustmentsData) setStockAdjustments(JSON.parse(stockAdjustmentsData.value));
-    } catch (e) { console.log('Error loading data'); }
-    setLoading(false);
+
+      if (salesData) setSales(salesData.map(toCamelCase));
+      if (purchasesData) setPurchases(purchasesData.map(toCamelCase));
+      if (customersData) setCustomers(customersData.map(toCamelCase));
+      if (suppliersData) setSuppliers(suppliersData.map(toCamelCase));
+      if (pipelineData) setPipelinePurchases(pipelineData.map(toCamelCase));
+      if (stockHoldsData) setStockHolds(stockHoldsData.map(toCamelCase));
+      if (stockAdjustmentsData) setStockAdjustments(stockAdjustmentsData.map(toCamelCase));
+    } catch (e) {
+      console.error('Error loading data:', e);
+      setError('Failed to load data from database');
+    }
   };
 
   const handleLogin = async (username, password) => {
     try {
-      let users = [];
-      try {
-        const usersData = await storage.get('users');
-        if (usersData) users = JSON.parse(usersData.value);
-      } catch (e) {}
-      if (users.length === 0) {
-        users = [{ id: 'admin-1', username: 'admin', password: 'admin123', role: 'admin', name: 'Administrator', initials: 'ADM' }];
-        await storage.set('users', JSON.stringify(users));
+      const { data: user, error } = await supabase
+        .from('users')
+        .select('*')
+        .ilike('username', username)
+        .eq('password', password)
+        .single();
+
+      if (error || !user) {
+        return { success: false, error: 'Invalid credentials' };
       }
-      const user = users.find(u => u.username.toLowerCase() === username.toLowerCase() && u.password === password);
-      if (user) {
-        const session = { id: user.id, username: user.username, role: user.role, name: user.name, initials: user.initials || user.username.substring(0, 3).toUpperCase() };
-        setCurrentUser(session);
-        await storage.set('current-session', JSON.stringify(session));
-        return { success: true };
-      }
-      return { success: false, error: 'Invalid credentials' };
-    } catch (e) { return { success: false, error: 'Login failed' }; }
+
+      const session = {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        name: user.name,
+        initials: user.initials || user.username.substring(0, 3).toUpperCase()
+      };
+      
+      setCurrentUser(session);
+      localStorage.setItem('eurofolic-session', JSON.stringify(session));
+      await loadAllData();
+      return { success: true };
+    } catch (e) {
+      console.error('Login error:', e);
+      return { success: false, error: 'Login failed' };
+    }
   };
 
-  const handleLogout = async () => {
+  const handleLogout = () => {
     setCurrentUser(null);
-    await storage.delete('current-session').catch(() => {});
+    localStorage.removeItem('eurofolic-session');
   };
 
-  const saveData = async (key, data) => {
-    await storage.set(key, JSON.stringify(data)).catch(() => {});
-  };
-
+  // ==================== SALES OPERATIONS ====================
   const addSale = async (sale) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newSales = [...sales, { ...sale, ...auditInfo, id: Date.now(), date: new Date().toISOString() }];
-    setSales(newSales);
-    await saveData('sales-data', newSales);
+    try {
+      const saleData = {
+        customer_id: sale.customerId || null,
+        customer: sale.customer,
+        country: sale.country,
+        end_destination: sale.endDestination,
+        size: sale.size,
+        batch_number: sale.batchNumber,
+        units: parseFloat(sale.units),
+        price: parseFloat(sale.price),
+        sale_date: sale.saleDate,
+        converted_from: sale.convertedFrom || null,
+        original_hold_id: sale.originalHoldId || null,
+        converted_by: sale.convertedBy || null,
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('sales')
+        .insert([saleData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setSales(prev => [toCamelCase(data), ...prev]);
+      return { success: true, data: toCamelCase(data) };
+    } catch (e) {
+      console.error('Add sale error:', e);
+      return { success: false, error: e.message };
+    }
   };
 
   const deleteSale = async (id) => {
-    const newSales = sales.filter(s => s.id !== id);
-    setSales(newSales);
-    await saveData('sales-data', newSales);
+    try {
+      const { error } = await supabase.from('sales').delete().eq('id', id);
+      if (error) throw error;
+      setSales(prev => prev.filter(s => s.id !== id));
+    } catch (e) {
+      console.error('Delete sale error:', e);
+    }
   };
 
+  // ==================== PURCHASES OPERATIONS ====================
   const addPurchase = async (purchase) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newPurchases = [...purchases, { ...purchase, ...auditInfo, id: Date.now(), date: new Date().toISOString() }];
-    setPurchases(newPurchases);
-    await saveData('purchases-data', newPurchases);
+    try {
+      const purchaseData = {
+        supplier_id: purchase.supplierId || null,
+        supplier: purchase.supplier,
+        size: purchase.size,
+        batch_number: purchase.batchNumber,
+        expiry_date: purchase.expiryDate,
+        units: parseFloat(purchase.units),
+        cost: parseFloat(purchase.cost),
+        purchase_date: purchase.purchaseDate,
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('purchases')
+        .insert([purchaseData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setPurchases(prev => [toCamelCase(data), ...prev]);
+    } catch (e) {
+      console.error('Add purchase error:', e);
+    }
   };
 
   const deletePurchase = async (id) => {
-    const newPurchases = purchases.filter(p => p.id !== id);
-    setPurchases(newPurchases);
-    await saveData('purchases-data', newPurchases);
+    try {
+      const { error } = await supabase.from('purchases').delete().eq('id', id);
+      if (error) throw error;
+      setPurchases(prev => prev.filter(p => p.id !== id));
+    } catch (e) {
+      console.error('Delete purchase error:', e);
+    }
   };
 
+  // ==================== CUSTOMERS OPERATIONS ====================
   const addCustomer = async (customer) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newCustomers = [...customers, { ...customer, ...auditInfo, id: Date.now() }];
-    setCustomers(newCustomers);
-    await saveData('customers-data', newCustomers);
+    try {
+      const customerData = {
+        name: customer.name,
+        country: customer.country,
+        contact_person: customer.contactPerson || null,
+        email: customer.email,
+        phone: customer.phone || null,
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('customers')
+        .insert([customerData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setCustomers(prev => [...prev, toCamelCase(data)].sort((a, b) => a.name.localeCompare(b.name)));
+    } catch (e) {
+      console.error('Add customer error:', e);
+    }
   };
 
   const deleteCustomer = async (id) => {
-    const newCustomers = customers.filter(c => c.id !== id);
-    setCustomers(newCustomers);
-    await saveData('customers-data', newCustomers);
+    try {
+      const { error } = await supabase.from('customers').delete().eq('id', id);
+      if (error) throw error;
+      setCustomers(prev => prev.filter(c => c.id !== id));
+    } catch (e) {
+      console.error('Delete customer error:', e);
+    }
   };
 
+  // ==================== SUPPLIERS OPERATIONS ====================
   const addSupplier = async (supplier) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newSuppliers = [...suppliers, { ...supplier, ...auditInfo, id: Date.now() }];
-    setSuppliers(newSuppliers);
-    await saveData('suppliers-data', newSuppliers);
+    try {
+      const supplierData = {
+        name: supplier.name,
+        country: supplier.country,
+        email: supplier.email || null,
+        phone: supplier.phone || null,
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('suppliers')
+        .insert([supplierData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setSuppliers(prev => [...prev, toCamelCase(data)].sort((a, b) => a.name.localeCompare(b.name)));
+    } catch (e) {
+      console.error('Add supplier error:', e);
+    }
   };
 
   const deleteSupplier = async (id) => {
-    const newSuppliers = suppliers.filter(s => s.id !== id);
-    setSuppliers(newSuppliers);
-    await saveData('suppliers-data', newSuppliers);
+    try {
+      const { error } = await supabase.from('suppliers').delete().eq('id', id);
+      if (error) throw error;
+      setSuppliers(prev => prev.filter(s => s.id !== id));
+    } catch (e) {
+      console.error('Delete supplier error:', e);
+    }
   };
 
+  // ==================== PIPELINE OPERATIONS ====================
   const addPipelinePurchase = async (pp) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newPP = [...pipelinePurchases, { ...pp, ...auditInfo, id: Date.now() }];
-    setPipelinePurchases(newPP);
-    await saveData('pipeline-purchases-data', newPP);
+    try {
+      const pipelineData = {
+        po_number: pp.poNumber,
+        supplier: pp.supplier,
+        size: pp.size,
+        units: parseFloat(pp.units),
+        price: parseFloat(pp.price),
+        total_value: parseFloat(pp.totalValue),
+        expected_date: pp.expectedDate,
+        status: pp.status || 'Ordered',
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('pipeline_purchases')
+        .insert([pipelineData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setPipelinePurchases(prev => [...prev, toCamelCase(data)]);
+    } catch (e) {
+      console.error('Add pipeline purchase error:', e);
+    }
   };
 
   const deletePipelinePurchase = async (id) => {
-    const newPP = pipelinePurchases.filter(p => p.id !== id);
-    setPipelinePurchases(newPP);
-    await saveData('pipeline-purchases-data', newPP);
+    try {
+      const { error } = await supabase.from('pipeline_purchases').delete().eq('id', id);
+      if (error) throw error;
+      setPipelinePurchases(prev => prev.filter(p => p.id !== id));
+    } catch (e) {
+      console.error('Delete pipeline purchase error:', e);
+    }
   };
 
+  // ==================== STOCK HOLDS OPERATIONS ====================
   const addStockHold = async (hold) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newHolds = [...stockHolds, { ...hold, ...auditInfo, id: Date.now() }];
-    setStockHolds(newHolds);
-    await saveData('stock-holds-data', newHolds);
+    try {
+      const holdData = {
+        customer_id: hold.customerId || null,
+        customer: hold.customer,
+        country: hold.country,
+        end_destination: hold.endDestination,
+        size: hold.size,
+        units: parseFloat(hold.units),
+        vials: parseInt(hold.vials),
+        notes: hold.notes || null,
+        hold_date: hold.holdDate,
+        reverted_from: hold.revertedFrom || null,
+        original_sale_id: hold.originalSaleId || null,
+        reverted_by: hold.revertedBy || null,
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('stock_holds')
+        .insert([holdData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setStockHolds(prev => [toCamelCase(data), ...prev]);
+      return { success: true, data: toCamelCase(data) };
+    } catch (e) {
+      console.error('Add stock hold error:', e);
+      return { success: false, error: e.message };
+    }
   };
 
   const deleteStockHold = async (id) => {
-    const newHolds = stockHolds.filter(h => h.id !== id);
-    setStockHolds(newHolds);
-    await saveData('stock-holds-data', newHolds);
+    try {
+      const { error } = await supabase.from('stock_holds').delete().eq('id', id);
+      if (error) throw error;
+      setStockHolds(prev => prev.filter(h => h.id !== id));
+    } catch (e) {
+      console.error('Delete stock hold error:', e);
+    }
   };
 
+  // ==================== STOCK ADJUSTMENTS OPERATIONS ====================
   const addStockAdjustment = async (adjustment) => {
-    const auditInfo = { createdBy: currentUser?.initials || 'SYS', createdAt: new Date().toISOString() };
-    const newAdjustments = [...stockAdjustments, { ...adjustment, ...auditInfo, id: Date.now(), date: new Date().toISOString() }];
-    setStockAdjustments(newAdjustments);
-    await saveData('stock-adjustments-data', newAdjustments);
+    try {
+      const adjustmentData = {
+        size: adjustment.size,
+        batch_number: adjustment.batchNumber,
+        units: parseFloat(adjustment.units),
+        vials: parseInt(adjustment.vials),
+        reason: adjustment.reason,
+        recipient: adjustment.recipient || null,
+        notes: adjustment.notes || null,
+        cost_per_pack: parseFloat(adjustment.costPerPack) || 0,
+        total_cost: parseFloat(adjustment.totalCost) || 0,
+        adjustment_date: adjustment.adjustmentDate,
+        created_by: currentUser?.initials || 'SYS'
+      };
+
+      const { data, error } = await supabase
+        .from('stock_adjustments')
+        .insert([adjustmentData])
+        .select()
+        .single();
+
+      if (error) throw error;
+      setStockAdjustments(prev => [toCamelCase(data), ...prev]);
+    } catch (e) {
+      console.error('Add stock adjustment error:', e);
+    }
   };
 
   const deleteStockAdjustment = async (id) => {
-    const newAdjustments = stockAdjustments.filter(a => a.id !== id);
-    setStockAdjustments(newAdjustments);
-    await saveData('stock-adjustments-data', newAdjustments);
+    try {
+      const { error } = await supabase.from('stock_adjustments').delete().eq('id', id);
+      if (error) throw error;
+      setStockAdjustments(prev => prev.filter(a => a.id !== id));
+    } catch (e) {
+      console.error('Delete stock adjustment error:', e);
+    }
   };
 
-  // Verify user password for secure operations
+  // ==================== SPECIAL OPERATIONS ====================
   const verifyPassword = async (username, password) => {
     try {
-      const usersData = await storage.get('users');
-      if (!usersData) return false;
-      const users = JSON.parse(usersData.value);
-      const user = users.find(u => u.username.toLowerCase() === username.toLowerCase() && u.password === password);
-      return !!user;
-    } catch (e) { return false; }
+      const { data, error } = await supabase
+        .from('users')
+        .select('id')
+        .ilike('username', username)
+        .eq('password', password)
+        .single();
+
+      return !error && data;
+    } catch (e) {
+      return false;
+    }
   };
 
-  // Convert stock hold to sale
   const convertHoldToSale = async (holdId, saleDetails) => {
     const hold = stockHolds.find(h => h.id === holdId);
     if (!hold) return { success: false, error: 'Stock hold not found' };
 
-    const auditInfo = { 
-      createdBy: currentUser?.initials || 'SYS', 
-      createdAt: new Date().toISOString(),
-      convertedFrom: 'stockHold',
-      originalHoldId: holdId,
-      convertedBy: currentUser?.initials || 'SYS'
-    };
+    try {
+      // Add the sale
+      const saleResult = await addSale({
+        ...saleDetails,
+        customer: hold.customer,
+        customerId: hold.customerId,
+        country: hold.country,
+        endDestination: hold.endDestination,
+        size: hold.size,
+        units: hold.units,
+        convertedFrom: 'stockHold',
+        originalHoldId: holdId,
+        convertedBy: currentUser?.initials || 'SYS'
+      });
 
-    const newSale = {
-      ...saleDetails,
-      customer: hold.customer,
-      country: hold.country,
-      endDestination: hold.endDestination,
-      size: hold.size,
-      units: hold.units,
-      vials: hold.vials,
-      ...auditInfo,
-      id: Date.now(),
-      date: new Date().toISOString()
-    };
+      if (!saleResult.success) {
+        return { success: false, error: saleResult.error };
+      }
 
-    // Add the sale
-    const newSales = [...sales, newSale];
-    setSales(newSales);
-    await saveData('sales-data', newSales);
+      // Delete the stock hold
+      await deleteStockHold(holdId);
 
-    // Remove the stock hold
-    const newHolds = stockHolds.filter(h => h.id !== holdId);
-    setStockHolds(newHolds);
-    await saveData('stock-holds-data', newHolds);
-
-    return { success: true, saleId: newSale.id };
+      return { success: true, saleId: saleResult.data.id };
+    } catch (e) {
+      console.error('Convert hold to sale error:', e);
+      return { success: false, error: e.message };
+    }
   };
 
-  // Revert sale back to stock hold (Admin only)
   const revertSaleToHold = async (saleId) => {
     const sale = sales.find(s => s.id === saleId);
     if (!sale) return { success: false, error: 'Sale not found' };
@@ -262,39 +521,35 @@ const App = () => {
       return { success: false, error: 'This sale was not converted from a stock hold' };
     }
 
-    const auditInfo = { 
-      createdBy: currentUser?.initials || 'SYS', 
-      createdAt: new Date().toISOString(),
-      revertedFrom: 'sale',
-      originalSaleId: saleId,
-      revertedBy: currentUser?.initials || 'SYS'
-    };
+    try {
+      // Recreate the stock hold
+      const holdResult = await addStockHold({
+        customer: sale.customer,
+        customerId: sale.customerId,
+        country: sale.country,
+        endDestination: sale.endDestination,
+        size: sale.size,
+        units: sale.units,
+        vials: sale.vials || Math.round(sale.units * VIALS_PER_PACK[sale.size]),
+        notes: `Reverted from sale on ${new Date().toLocaleDateString()}`,
+        holdDate: new Date().toISOString().split('T')[0],
+        revertedFrom: 'sale',
+        originalSaleId: saleId,
+        revertedBy: currentUser?.initials || 'SYS'
+      });
 
-    // Recreate the stock hold
-    const newHold = {
-      customer: sale.customer,
-      country: sale.country,
-      endDestination: sale.endDestination,
-      size: sale.size,
-      units: sale.units,
-      vials: sale.vials || (sale.units * VIALS_PER_PACK[sale.size]),
-      notes: `Reverted from sale on ${new Date().toLocaleDateString()}`,
-      holdDate: new Date().toISOString().split('T')[0],
-      ...auditInfo,
-      id: Date.now()
-    };
+      if (!holdResult.success) {
+        return { success: false, error: holdResult.error };
+      }
 
-    // Add the stock hold back
-    const newHolds = [...stockHolds, newHold];
-    setStockHolds(newHolds);
-    await saveData('stock-holds-data', newHolds);
+      // Delete the sale
+      await deleteSale(saleId);
 
-    // Remove the sale
-    const newSales = sales.filter(s => s.id !== saleId);
-    setSales(newSales);
-    await saveData('sales-data', newSales);
-
-    return { success: true, holdId: newHold.id };
+      return { success: true, holdId: holdResult.data.id };
+    } catch (e) {
+      console.error('Revert sale to hold error:', e);
+      return { success: false, error: e.message };
+    }
   };
 
   const calcMetrics = () => {
@@ -305,20 +560,20 @@ const App = () => {
       const adj = stockAdjustments.filter(a => a.size === size);
       const sold = ss.reduce((a, s) => a + (parseFloat(s.units) || 0), 0);
       const purchased = ps.reduce((a, p) => a + (parseFloat(p.units) || 0), 0);
-      const adjusted = adj.reduce((a, x) => a + (parseFloat(x.units) || 0), 0); // samples/adjustments taken out
+      const adjusted = adj.reduce((a, x) => a + (parseFloat(x.units) || 0), 0);
       const adjustedValue = adj.reduce((a, x) => a + (parseFloat(x.units) || 0) * (parseFloat(x.costPerPack) || 0), 0);
       const revenue = ss.reduce((a, s) => a + (parseFloat(s.units) || 0) * (parseFloat(s.price) || 0), 0);
       const cost = ps.reduce((a, p) => a + (parseFloat(p.units) || 0) * (parseFloat(p.cost) || 0), 0);
       const avgCost = purchased > 0 ? cost / purchased : 0;
-      const stock = purchased - sold - adjusted; // subtract samples from stock
+      const stock = purchased - sold - adjusted;
       const vialsPerPack = VIALS_PER_PACK[size];
       const soldVials = sold * vialsPerPack;
       const purchasedVials = purchased * vialsPerPack;
       const adjustedVials = adjusted * vialsPerPack;
       const stockVials = stock * vialsPerPack;
-      m[size] = { 
+      m[size] = {
         stock, revenue, cost, sold, purchased, adjusted,
-        stockValue: stock * avgCost, 
+        stockValue: stock * avgCost,
         margin: revenue - (sold * avgCost),
         adjustedValue,
         vialsPerPack,
@@ -331,8 +586,51 @@ const App = () => {
     return m;
   };
 
-  if (loading) return <div className="flex items-center justify-center h-screen"><div className="text-lg">Loading...</div></div>;
-  if (!currentUser) return <LoginScreen onLogin={handleLogin} />;
+  // Loading screen
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+          <div className="text-lg text-gray-600">Connecting to database...</div>
+        </div>
+      </div>
+    );
+  }
+
+  // Not connected / Error screen
+  if (!dbConnected) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <div className="bg-white rounded-lg shadow-xl p-8 max-w-md text-center">
+          <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+          <h1 className="text-xl font-bold text-gray-900 mb-2">Database Connection Failed</h1>
+          <p className="text-gray-600 mb-4">{error || 'Unable to connect to Supabase database.'}</p>
+          <div className="bg-gray-100 rounded-lg p-4 text-left text-sm mb-4">
+            <p className="font-semibold mb-2">To configure Supabase:</p>
+            <ol className="list-decimal list-inside space-y-1 text-gray-700">
+              <li>Create a Supabase project at supabase.com</li>
+              <li>Run the schema.sql in your SQL Editor</li>
+              <li>Update supabaseClient.js with your credentials</li>
+              <li>Refresh this page</li>
+            </ol>
+          </div>
+          <button
+            onClick={initializeApp}
+            className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 flex items-center gap-2 mx-auto"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Retry Connection
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Login screen
+  if (!currentUser) {
+    return <LoginScreen onLogin={handleLogin} />;
+  }
 
   const isAdmin = currentUser.role === 'admin';
   const metrics = calcMetrics();
@@ -351,6 +649,7 @@ const App = () => {
             <p className="text-sm"><span className="bg-black text-yellow-400 px-2 py-0.5 font-medium">Customer & Inventory Management System</span></p>
           </div>
           <div className="flex items-center gap-4">
+            <ConnectionStatus isConnected={dbConnected} onRetry={initializeApp} />
             <div className="text-right">
               <div className="text-sm font-medium">{currentUser.name}</div>
               <div className="text-xs text-gray-700">{isAdmin ? 'Administrator' : 'User'}</div>
@@ -382,14 +681,19 @@ const App = () => {
   );
 };
 
+// ==================== LOGIN SCREEN ====================
 const LoginScreen = ({ onLogin }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
 
   const handleSubmit = async () => {
     if (!username || !password) { setError('Enter credentials'); return; }
+    setLoading(true);
+    setError('');
     const result = await onLogin(username, password);
+    setLoading(false);
     if (!result.success) setError(result.error);
   };
 
@@ -402,22 +706,57 @@ const LoginScreen = ({ onLogin }) => {
           </div>
           <h1 className="text-2xl font-bold">Eurofolic<sup className="text-xs">®</sup> CIMS</h1>
           <p className="text-sm mt-2"><span className="bg-black text-yellow-400 px-2 py-0.5 font-medium">Customer & Inventory Management System</span></p>
+          <div className="mt-3 flex items-center justify-center gap-2 text-xs text-green-600">
+            <Database className="w-3 h-3" />
+            Connected to Supabase
+          </div>
         </div>
         <div className="space-y-4">
-          <input type="text" value={username} onChange={(e) => setUsername(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && handleSubmit()} placeholder="Username" className="w-full border rounded-lg px-3 py-2" />
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyPress={(e) => e.key === 'Enter' && handleSubmit()} placeholder="Password" className="w-full border rounded-lg px-3 py-2" />
+          <input
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleSubmit()}
+            placeholder="Username"
+            className="w-full border rounded-lg px-3 py-2"
+            disabled={loading}
+          />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleSubmit()}
+            placeholder="Password"
+            className="w-full border rounded-lg px-3 py-2"
+            disabled={loading}
+          />
           {error && <div className="bg-red-50 text-red-700 px-4 py-3 rounded-lg text-sm">{error}</div>}
-          <button onClick={handleSubmit} className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700">Sign In</button>
+          <button
+            onClick={handleSubmit}
+            disabled={loading}
+            className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center justify-center gap-2"
+          >
+            {loading ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                Signing in...
+              </>
+            ) : (
+              'Sign In'
+            )}
+          </button>
+          <p className="text-xs text-gray-500 text-center mt-4">Default: <span className="font-mono">admin</span> / <span className="font-mono">admin123</span></p>
         </div>
       </div>
     </div>
   );
 };
 
+// ==================== DASHBOARD ====================
 const Dashboard = ({ metrics, totalStock, totalStockVials, totalRevenue, totalMargin, totalStockValue, sales, purchases, stockAdjustments }) => {
   const [selectedYear, setSelectedYear] = useState('all');
   const chartData = SIZES.map(s => ({ name: s, packs: metrics[s].stock, vials: metrics[s].stockVials }));
-  const years = [...new Set(sales.map(s => new Date(s.saleDate || s.date).getFullYear()))].sort((a, b) => b - a);
+  const years = [...new Set(sales.map(s => new Date(s.saleDate || s.createdAt).getFullYear()))].filter(y => !isNaN(y)).sort((a, b) => b - a);
   const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1'];
 
   const totalAdjusted = SIZES.reduce((a, s) => a + (metrics[s].adjusted || 0), 0);
@@ -426,7 +765,7 @@ const Dashboard = ({ metrics, totalStock, totalStockVials, totalRevenue, totalMa
 
   const getCountrySales = () => {
     const filtered = selectedYear === 'all' ? sales : sales.filter(s => {
-      const d = s.saleDate || s.date;
+      const d = s.saleDate || s.createdAt;
       return d && new Date(d).getFullYear() === parseInt(selectedYear);
     });
     
@@ -477,14 +816,14 @@ const Dashboard = ({ metrics, totalStock, totalStockVials, totalRevenue, totalMa
               {SIZES.map((size) => (
                 <tr key={size} className="hover:bg-gray-50">
                   <td className="px-4 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{size}</td>
-                  <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-600">{metrics[size].purchased}</td>
-                  <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-600">{metrics[size].sold}</td>
-                  <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-orange-600">{metrics[size].adjusted || 0} <span className="text-xs text-orange-400">({metrics[size].adjustedVials || 0}v)</span></td>
+                  <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-600">{metrics[size].purchased.toFixed(2)}</td>
+                  <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-600">{metrics[size].sold.toFixed(2)}</td>
+                  <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-orange-600">{(metrics[size].adjusted || 0).toFixed(2)} <span className="text-xs text-orange-400">({metrics[size].adjustedVials || 0}v)</span></td>
                   <td className="px-4 py-4 whitespace-nowrap text-sm text-right font-bold">
-                    <span className={metrics[size].stock <= 0 ? 'text-red-600' : 'text-green-600'}>{metrics[size].stock}</span>
+                    <span className={metrics[size].stock <= 0 ? 'text-red-600' : 'text-green-600'}>{metrics[size].stock.toFixed(2)}</span>
                   </td>
                   <td className="px-4 py-4 whitespace-nowrap text-sm text-right font-bold">
-                    <span className={metrics[size].stockVials <= 0 ? 'text-red-600' : 'text-green-600'}>{metrics[size].stockVials}</span>
+                    <span className={metrics[size].stockVials <= 0 ? 'text-red-600' : 'text-green-600'}>{metrics[size].stockVials.toFixed(0)}</span>
                   </td>
                   <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">€{metrics[size].stockValue.toFixed(2)}</td>
                   <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-orange-600">€{(metrics[size].adjustedValue || 0).toFixed(2)}</td>
@@ -494,11 +833,11 @@ const Dashboard = ({ metrics, totalStock, totalStockVials, totalRevenue, totalMa
               ))}
               <tr className="bg-green-100 font-bold">
                 <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">TOTAL</td>
-                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{SIZES.reduce((a, s) => a + metrics[s].purchased, 0)}</td>
-                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{SIZES.reduce((a, s) => a + metrics[s].sold, 0)}</td>
-                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-orange-600">{totalAdjusted} <span className="text-xs text-orange-500">({totalAdjustedVials}v)</span></td>
-                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{totalStock}</td>
-                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{totalStockVials}</td>
+                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{SIZES.reduce((a, s) => a + metrics[s].purchased, 0).toFixed(2)}</td>
+                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{SIZES.reduce((a, s) => a + metrics[s].sold, 0).toFixed(2)}</td>
+                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-orange-600">{totalAdjusted.toFixed(2)} <span className="text-xs text-orange-500">({totalAdjustedVials.toFixed(0)}v)</span></td>
+                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{totalStock.toFixed(2)}</td>
+                <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">{totalStockVials.toFixed(0)}</td>
                 <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-gray-900">€{totalStockValue.toFixed(2)}</td>
                 <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-orange-600">€{totalAdjustedValue.toFixed(2)}</td>
                 <td className="px-4 py-4 whitespace-nowrap text-sm text-right text-blue-600">€{totalRevenue.toFixed(2)}</td>
@@ -519,10 +858,10 @@ const Dashboard = ({ metrics, totalStock, totalStockVials, totalRevenue, totalMa
             <Tooltip />
             <Legend />
             <Bar dataKey="packs" fill="#3b82f6" name="Packs">
-              <LabelList dataKey="packs" position="top" fill="#3b82f6" fontWeight="bold" fontSize={12} />
+              <LabelList dataKey="packs" position="top" fill="#3b82f6" fontWeight="bold" fontSize={12} formatter={(v) => v.toFixed(1)} />
             </Bar>
             <Bar dataKey="vials" fill="#10b981" name="Vials">
-              <LabelList dataKey="vials" position="top" fill="#10b981" fontWeight="bold" fontSize={12} />
+              <LabelList dataKey="vials" position="top" fill="#10b981" fontWeight="bold" fontSize={12} formatter={(v) => v.toFixed(0)} />
             </Bar>
           </BarChart>
         </ResponsiveContainer>
@@ -587,6 +926,7 @@ const Dashboard = ({ metrics, totalStock, totalStockVials, totalRevenue, totalMa
   );
 };
 
+// ==================== SALES COMPONENT ====================
 const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteStockHold, stockAdjustments, addStockAdjustment, deleteStockAdjustment, convertHoldToSale, revertSaleToHold, verifyPassword, currentUser, activeSize, setActiveSize, isAdmin, customers, purchases }) => {
   const [showForm, setShowForm] = useState(false);
   const [showHoldForm, setShowHoldForm] = useState(false);
@@ -610,72 +950,62 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
     const ss = sales.filter(s => s.size === activeSize);
     const adj = stockAdjustments.filter(a => a.size === activeSize);
     const batches = {};
-    ps.forEach(p => { if (!batches[p.batchNumber]) batches[p.batchNumber] = { purchased: 0, sold: 0, adjusted: 0, supplier: p.supplier, expiryDate: p.expiryDate, cost: p.cost }; batches[p.batchNumber].purchased += parseFloat(p.units) || 0; });
+    ps.forEach(p => {
+      if (!batches[p.batchNumber]) batches[p.batchNumber] = { purchased: 0, sold: 0, adjusted: 0, supplier: p.supplier, expiryDate: p.expiryDate, cost: p.cost };
+      batches[p.batchNumber].purchased += parseFloat(p.units) || 0;
+    });
     ss.forEach(s => { if (batches[s.batchNumber]) batches[s.batchNumber].sold += parseFloat(s.units) || 0; });
     adj.forEach(a => { if (batches[a.batchNumber]) batches[a.batchNumber].adjusted += parseFloat(a.units) || 0; });
     return Object.entries(batches).filter(([k, v]) => v.purchased - v.sold - v.adjusted > 0).map(([k, v]) => ({ batch: k, availablePacks: v.purchased - v.sold - v.adjusted, availableVials: (v.purchased - v.sold - v.adjusted) * VIALS_PER_PACK[activeSize], supplier: v.supplier, expiryDate: v.expiryDate, costPerPack: v.cost }));
   };
 
-  // Get batch cost for samples (at cost price)
   const getBatchCost = (batchNumber) => {
     const purchase = purchases.find(p => p.batchNumber === batchNumber && p.size === activeSize);
-    return purchase ? purchase.cost : 0; // cost per pack
+    return purchase ? purchase.cost : 0;
   };
 
   const handleCustomer = (id) => {
-    const c = customers.find(c => c.id === parseInt(id));
+    const c = customers.find(c => c.id === id);
     setForm({ ...form, customerId: id, customer: c ? c.name : '', country: c ? c.country : '' });
   };
 
   const handleHoldCustomer = (id) => {
-    const c = customers.find(c => c.id === parseInt(id));
+    const c = customers.find(c => c.id === id);
     setHoldForm({ ...holdForm, customerId: id, customer: c ? c.name : '', country: c ? c.country : '' });
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!form.customer || !form.batchNumber || !form.vials || !form.pricePerVial || !form.endDestination) { alert('Fill all fields including End Destination'); return; }
     const vials = parseFloat(form.vials);
     const vialsPerPack = VIALS_PER_PACK[activeSize];
     const packs = vials / vialsPerPack;
     const pricePerPack = parseFloat(form.pricePerVial) * vialsPerPack;
-    addSale({ ...form, size: activeSize, units: packs, price: pricePerPack });
+    await addSale({ ...form, size: activeSize, units: packs, price: pricePerPack });
     setForm({ customerId: '', customer: '', country: '', endDestination: '', batchNumber: '', vials: '', pricePerVial: '', saleDate: new Date().toISOString().split('T')[0] });
     setShowForm(false);
   };
 
-  const handleHoldSubmit = () => {
+  const handleHoldSubmit = async () => {
     if (!holdForm.customer || !holdForm.vials || !holdForm.endDestination) { alert('Customer, vials, and End Destination are required'); return; }
     const vials = parseFloat(holdForm.vials);
     const vialsPerPack = VIALS_PER_PACK[activeSize];
     const packs = vials / vialsPerPack;
-    addStockHold({ ...holdForm, size: activeSize, units: packs, vials: vials });
+    await addStockHold({ ...holdForm, size: activeSize, units: packs, vials: vials });
     setHoldForm({ customerId: '', customer: '', country: '', endDestination: '', vials: '', notes: '', holdDate: new Date().toISOString().split('T')[0] });
     setShowHoldForm(false);
   };
 
-  const handleSampleSubmit = () => {
-    if (!sampleForm.batchNumber || !sampleForm.vials || !sampleForm.reason) { 
-      alert('Batch, vials, and reason are required'); 
-      return; 
-    }
+  const handleSampleSubmit = async () => {
+    if (!sampleForm.batchNumber || !sampleForm.vials || !sampleForm.reason) { alert('Batch, vials, and reason are required'); return; }
     const vials = parseFloat(sampleForm.vials);
     const vialsPerPack = VIALS_PER_PACK[activeSize];
     const packs = vials / vialsPerPack;
     const costPerPack = getBatchCost(sampleForm.batchNumber);
-    
-    addStockAdjustment({ 
-      ...sampleForm, 
-      size: activeSize, 
-      units: packs, 
-      vials: vials,
-      costPerPack: costPerPack,
-      totalCost: packs * costPerPack
-    });
+    await addStockAdjustment({ ...sampleForm, size: activeSize, units: packs, vials: vials, costPerPack: costPerPack, totalCost: packs * costPerPack });
     setSampleForm({ batchNumber: '', vials: '', reason: 'Retention Sample', recipient: '', notes: '', adjustmentDate: new Date().toISOString().split('T')[0] });
     setShowSampleForm(false);
   };
 
-  // Open convert modal for a stock hold
   const openConvertModal = (hold) => {
     setSelectedHold(hold);
     setConvertForm({ batchNumber: '', pricePerVial: '', saleDate: new Date().toISOString().split('T')[0], password: '' });
@@ -683,35 +1013,23 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
     setShowConvertModal(true);
   };
 
-  // Handle convert stock hold to sale
   const handleConvertToSale = async () => {
     if (!convertForm.batchNumber || !convertForm.pricePerVial || !convertForm.password) {
       setModalError('Please fill all fields including your password');
       return;
     }
-
     setModalLoading(true);
     setModalError('');
-
-    // Verify password
     const isValid = await verifyPassword(currentUser.username, convertForm.password);
     if (!isValid) {
       setModalError('Invalid password. Please try again.');
       setModalLoading(false);
       return;
     }
-
     const vialsPerPack = VIALS_PER_PACK[selectedHold.size];
     const pricePerPack = parseFloat(convertForm.pricePerVial) * vialsPerPack;
-
-    const result = await convertHoldToSale(selectedHold.id, {
-      batchNumber: convertForm.batchNumber,
-      price: pricePerPack,
-      saleDate: convertForm.saleDate
-    });
-
+    const result = await convertHoldToSale(selectedHold.id, { batchNumber: convertForm.batchNumber, price: pricePerPack, saleDate: convertForm.saleDate });
     setModalLoading(false);
-
     if (result.success) {
       setShowConvertModal(false);
       setSelectedHold(null);
@@ -721,7 +1039,6 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
     }
   };
 
-  // Open revert modal for a sale (Admin only)
   const openRevertModal = (sale) => {
     setSelectedSale(sale);
     setRevertPassword('');
@@ -729,28 +1046,18 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
     setShowRevertModal(true);
   };
 
-  // Handle revert sale back to stock hold
   const handleRevertToHold = async () => {
-    if (!revertPassword) {
-      setModalError('Please enter your password');
-      return;
-    }
-
+    if (!revertPassword) { setModalError('Please enter your password'); return; }
     setModalLoading(true);
     setModalError('');
-
-    // Verify password
     const isValid = await verifyPassword(currentUser.username, revertPassword);
     if (!isValid) {
       setModalError('Invalid password. Please try again.');
       setModalLoading(false);
       return;
     }
-
     const result = await revertSaleToHold(selectedSale.id);
-
     setModalLoading(false);
-
     if (result.success) {
       setShowRevertModal(false);
       setSelectedSale(null);
@@ -788,32 +1095,20 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
           {form.customer && <div className="bg-blue-50 p-3 rounded text-sm">Selected: {form.customer} ({form.country})</div>}
           <div>
             <label className="block text-xs text-gray-500 mb-1">End Destination (Final Sales Country)</label>
-            <input type="text" placeholder="Enter end destination country" value={form.endDestination} onChange={(e) => setForm({...form, endDestination: e.target.value})} className="w-full border rounded-lg px-3 py-2" />
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Sale Date</label>
-              <input type="date" value={form.saleDate} onChange={(e) => setForm({...form, saleDate: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-            </div>
-            <select value={form.batchNumber} onChange={(e) => setForm({...form, batchNumber: e.target.value})} className="border rounded-lg px-3 py-2">
-              <option value="">Select batch...</option>
-              {batches.map(b => <option key={b.batch} value={b.batch}>{b.batch} - {b.availableVials} vials available</option>)}
+            <select value={form.endDestination} onChange={(e) => setForm({...form, endDestination: e.target.value})} className="w-full border rounded-lg px-3 py-2">
+              <option value="">Select end destination...</option>
+              {COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}
             </select>
           </div>
           <div className="grid grid-cols-2 gap-4">
-            <div>
-              <input type="number" placeholder="Number of Vials" value={form.vials} onChange={(e) => setForm({...form, vials: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-              {form.vials && <p className="text-xs text-gray-500 mt-1">= {(parseFloat(form.vials) / vialsPerPack).toFixed(2)} packs</p>}
-            </div>
-            <div>
-              <input type="number" placeholder="Price per vial €" step="0.01" value={form.pricePerVial} onChange={(e) => setForm({...form, pricePerVial: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-              {form.pricePerVial && <p className="text-xs text-gray-500 mt-1">= €{(parseFloat(form.pricePerVial) * vialsPerPack).toFixed(2)} per pack</p>}
-            </div>
+            <div><label className="block text-xs text-gray-500 mb-1">Sale Date</label><input type="date" value={form.saleDate} onChange={(e) => setForm({...form, saleDate: e.target.value})} className="border rounded-lg px-3 py-2 w-full" /></div>
+            <select value={form.batchNumber} onChange={(e) => setForm({...form, batchNumber: e.target.value})} className="border rounded-lg px-3 py-2"><option value="">Select batch...</option>{batches.map(b => <option key={b.batch} value={b.batch}>{b.batch} - {b.availableVials.toFixed(0)} vials available</option>)}</select>
           </div>
-          <div className="flex gap-2">
-            <button onClick={handleSubmit} className="bg-purple-600 text-white px-4 py-2 rounded-lg">Save</button>
-            <button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
+          <div className="grid grid-cols-2 gap-4">
+            <div><input type="number" placeholder="Number of Vials" value={form.vials} onChange={(e) => setForm({...form, vials: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />{form.vials && <p className="text-xs text-gray-500 mt-1">= {(parseFloat(form.vials) / vialsPerPack).toFixed(2)} packs</p>}</div>
+            <div><input type="number" placeholder="Price per vial €" step="0.01" value={form.pricePerVial} onChange={(e) => setForm({...form, pricePerVial: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />{form.pricePerVial && <p className="text-xs text-gray-500 mt-1">= €{(parseFloat(form.pricePerVial) * vialsPerPack).toFixed(2)} per pack</p>}</div>
           </div>
+          <div className="flex gap-2"><button onClick={handleSubmit} className="bg-purple-600 text-white px-4 py-2 rounded-lg">Save</button><button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
 
@@ -821,20 +1116,11 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
         <div className="bg-amber-50 border border-amber-200 rounded-lg shadow p-6 space-y-4">
           <h3 className="font-semibold text-amber-800">New Stock Hold - {activeSize}</h3>
           <p className="text-xs text-amber-600">Stock holds are for committed stock that has not yet been sold.</p>
-          <select value={holdForm.customerId} onChange={(e) => handleHoldCustomer(e.target.value)} className="w-full border border-amber-300 rounded-lg px-3 py-2">
-            <option value="">Select customer...</option>
-            {customers.map(c => <option key={c.id} value={c.id}>{c.name} - {c.country}</option>)}
-          </select>
-          <input type="text" placeholder="Enter end destination country" value={holdForm.endDestination} onChange={(e) => setHoldForm({...holdForm, endDestination: e.target.value})} className="w-full border border-amber-300 rounded-lg px-3 py-2" />
-          <div className="grid grid-cols-2 gap-4">
-            <input type="date" value={holdForm.holdDate} onChange={(e) => setHoldForm({...holdForm, holdDate: e.target.value})} className="border border-amber-300 rounded-lg px-3 py-2" />
-            <input type="number" placeholder="Number of Vials" value={holdForm.vials} onChange={(e) => setHoldForm({...holdForm, vials: e.target.value})} className="border border-amber-300 rounded-lg px-3 py-2" />
-          </div>
+          <select value={holdForm.customerId} onChange={(e) => handleHoldCustomer(e.target.value)} className="w-full border border-amber-300 rounded-lg px-3 py-2"><option value="">Select customer...</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name} - {c.country}</option>)}</select>
+          <select value={holdForm.endDestination} onChange={(e) => setHoldForm({...holdForm, endDestination: e.target.value})} className="w-full border border-amber-300 rounded-lg px-3 py-2"><option value="">Select end destination...</option>{COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}</select>
+          <div className="grid grid-cols-2 gap-4"><input type="date" value={holdForm.holdDate} onChange={(e) => setHoldForm({...holdForm, holdDate: e.target.value})} className="border border-amber-300 rounded-lg px-3 py-2" /><input type="number" placeholder="Number of Vials" value={holdForm.vials} onChange={(e) => setHoldForm({...holdForm, vials: e.target.value})} className="border border-amber-300 rounded-lg px-3 py-2" /></div>
           <input type="text" placeholder="Notes (optional)" value={holdForm.notes} onChange={(e) => setHoldForm({...holdForm, notes: e.target.value})} className="w-full border border-amber-300 rounded-lg px-3 py-2" />
-          <div className="flex gap-2">
-            <button onClick={handleHoldSubmit} className="bg-amber-500 text-white px-4 py-2 rounded-lg">Save Hold</button>
-            <button onClick={() => setShowHoldForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div className="flex gap-2"><button onClick={handleHoldSubmit} className="bg-amber-500 text-white px-4 py-2 rounded-lg">Save Hold</button><button onClick={() => setShowHoldForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
 
@@ -842,83 +1128,36 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
         <div className="bg-orange-50 border border-orange-200 rounded-lg shadow p-6 space-y-4">
           <h3 className="font-semibold text-orange-800">Record Sample/Stock Adjustment - {activeSize}</h3>
           <p className="text-xs text-orange-600">Samples are recorded at cost price and deducted from available stock.</p>
-          
           <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs text-orange-700 mb-1">Select Batch *</label>
-              <select value={sampleForm.batchNumber} onChange={(e) => setSampleForm({...sampleForm, batchNumber: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2">
-                <option value="">Select batch...</option>
-                {batches.map(b => (
-                  <option key={b.batch} value={b.batch}>{b.batch} - {b.availableVials} vials available (€{(b.costPerPack / vialsPerPack).toFixed(2)}/vial)</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs text-orange-700 mb-1">Number of Vials *</label>
-              <input type="number" placeholder="Enter vials" value={sampleForm.vials} onChange={(e) => setSampleForm({...sampleForm, vials: e.target.value})} className="border border-orange-300 rounded-lg px-3 py-2 w-full" />
-              {sampleForm.vials && sampleForm.batchNumber && (
-                <p className="text-xs text-orange-600 mt-1">
-                  = {(parseFloat(sampleForm.vials) / vialsPerPack).toFixed(2)} packs | 
-                  Cost: €{((parseFloat(sampleForm.vials) / vialsPerPack) * getBatchCost(sampleForm.batchNumber)).toFixed(2)}
-                </p>
-              )}
-            </div>
+            <div><label className="block text-xs text-orange-700 mb-1">Select Batch *</label><select value={sampleForm.batchNumber} onChange={(e) => setSampleForm({...sampleForm, batchNumber: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2"><option value="">Select batch...</option>{batches.map(b => (<option key={b.batch} value={b.batch}>{b.batch} - {b.availableVials.toFixed(0)} vials available (€{(b.costPerPack / vialsPerPack).toFixed(2)}/vial)</option>))}</select></div>
+            <div><label className="block text-xs text-orange-700 mb-1">Number of Vials *</label><input type="number" placeholder="Enter vials" value={sampleForm.vials} onChange={(e) => setSampleForm({...sampleForm, vials: e.target.value})} className="border border-orange-300 rounded-lg px-3 py-2 w-full" />{sampleForm.vials && sampleForm.batchNumber && (<p className="text-xs text-orange-600 mt-1">= {(parseFloat(sampleForm.vials) / vialsPerPack).toFixed(2)} packs | Cost: €{((parseFloat(sampleForm.vials) / vialsPerPack) * getBatchCost(sampleForm.batchNumber)).toFixed(2)}</p>)}</div>
           </div>
-
           <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs text-orange-700 mb-1">Reason *</label>
-              <select value={sampleForm.reason} onChange={(e) => setSampleForm({...sampleForm, reason: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2">
-                {SAMPLE_REASONS.map(r => <option key={r} value={r}>{r}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs text-orange-700 mb-1">Date</label>
-              <input type="date" value={sampleForm.adjustmentDate} onChange={(e) => setSampleForm({...sampleForm, adjustmentDate: e.target.value})} className="border border-orange-300 rounded-lg px-3 py-2 w-full" />
-            </div>
+            <div><label className="block text-xs text-orange-700 mb-1">Reason *</label><select value={sampleForm.reason} onChange={(e) => setSampleForm({...sampleForm, reason: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2">{SAMPLE_REASONS.map(r => <option key={r} value={r}>{r}</option>)}</select></div>
+            <div><label className="block text-xs text-orange-700 mb-1">Date</label><input type="date" value={sampleForm.adjustmentDate} onChange={(e) => setSampleForm({...sampleForm, adjustmentDate: e.target.value})} className="border border-orange-300 rounded-lg px-3 py-2 w-full" /></div>
           </div>
-
-          <div>
-            <label className="block text-xs text-orange-700 mb-1">Recipient (if giving to external party)</label>
-            <input type="text" placeholder="e.g., Company name, Contact person" value={sampleForm.recipient} onChange={(e) => setSampleForm({...sampleForm, recipient: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2" />
-          </div>
-
-          <div>
-            <label className="block text-xs text-orange-700 mb-1">Notes</label>
-            <input type="text" placeholder="Additional notes..." value={sampleForm.notes} onChange={(e) => setSampleForm({...sampleForm, notes: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2" />
-          </div>
-
-          <div className="flex gap-2">
-            <button onClick={handleSampleSubmit} className="bg-orange-500 text-white px-4 py-2 rounded-lg hover:bg-orange-600">Record Sample</button>
-            <button onClick={() => setShowSampleForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div><label className="block text-xs text-orange-700 mb-1">Recipient (if giving to external party)</label><input type="text" placeholder="e.g., Company name, Contact person" value={sampleForm.recipient} onChange={(e) => setSampleForm({...sampleForm, recipient: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2" /></div>
+          <div><label className="block text-xs text-orange-700 mb-1">Notes</label><input type="text" placeholder="Additional notes..." value={sampleForm.notes} onChange={(e) => setSampleForm({...sampleForm, notes: e.target.value})} className="w-full border border-orange-300 rounded-lg px-3 py-2" /></div>
+          <div className="flex gap-2"><button onClick={handleSampleSubmit} className="bg-orange-500 text-white px-4 py-2 rounded-lg hover:bg-orange-600">Record Sample</button><button onClick={() => setShowSampleForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
       
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Customer</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">End Dest.</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Batch</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Packs</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th></tr>
-          </thead>
+          <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Customer</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">End Dest.</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Batch</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Packs</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th></tr></thead>
           <tbody className="divide-y divide-gray-200">
             {filtered.map(s => (
               <tr key={s.id} className={s.convertedFrom === 'stockHold' ? 'bg-green-50' : ''}>
-                <td className="px-4 py-3 text-sm">
-                  {new Date(s.saleDate || s.date).toLocaleDateString()}
-                  <AuditTag createdBy={s.createdBy} createdAt={s.createdAt} />
-                  {s.convertedFrom === 'stockHold' && <span className="inline-block mt-1 px-1.5 py-0.5 bg-green-100 text-green-700 text-xs rounded">From Hold</span>}
-                </td>
+                <td className="px-4 py-3 text-sm">{new Date(s.saleDate || s.createdAt).toLocaleDateString()}<AuditTag createdBy={s.createdBy} createdAt={s.createdAt} />{s.convertedFrom === 'stockHold' && <span className="inline-block mt-1 px-1.5 py-0.5 bg-green-100 text-green-700 text-xs rounded">From Hold</span>}</td>
                 <td className="px-4 py-3 text-sm font-medium">{s.customer}</td>
                 <td className="px-4 py-3 text-sm">{s.endDestination || s.country || '-'}</td>
                 <td className="px-4 py-3 text-sm text-purple-600">{s.batchNumber}</td>
-                <td className="px-4 py-3 text-sm">{s.units}</td>
-                <td className="px-4 py-3 text-sm text-gray-500">{s.units * vialsPerPack}</td>
-                <td className="px-4 py-3 text-sm font-semibold">€{(s.units * s.price).toFixed(2)}</td>
+                <td className="px-4 py-3 text-sm">{parseFloat(s.units).toFixed(2)}</td>
+                <td className="px-4 py-3 text-sm text-gray-500">{(parseFloat(s.units) * vialsPerPack).toFixed(0)}</td>
+                <td className="px-4 py-3 text-sm font-semibold">€{(parseFloat(s.units) * parseFloat(s.price)).toFixed(2)}</td>
                 <td className="px-4 py-3 text-sm">
                   <div className="flex gap-2">
-                    {isAdmin && s.convertedFrom === 'stockHold' && (
-                      <button onClick={() => openRevertModal(s)} className="text-orange-600 hover:text-orange-800 text-xs font-medium">Revert</button>
-                    )}
+                    {isAdmin && s.convertedFrom === 'stockHold' && (<button onClick={() => openRevertModal(s)} className="text-orange-600 hover:text-orange-800 text-xs font-medium">Revert</button>)}
                     {isAdmin && <button onClick={() => deleteSale(s.id)} className="text-red-600 hover:text-red-800">Delete</button>}
                   </div>
                 </td>
@@ -930,14 +1169,9 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
       </div>
 
       <div className="bg-amber-50 border border-amber-200 rounded-lg shadow overflow-hidden">
-        <div className="px-4 py-3 bg-amber-100 border-b border-amber-200">
-          <h3 className="font-semibold text-amber-800">Stock Holds</h3>
-          <p className="text-xs text-amber-600">Click "Convert to Sale" to finalize a hold into an actual sale</p>
-        </div>
+        <div className="px-4 py-3 bg-amber-100 border-b border-amber-200"><h3 className="font-semibold text-amber-800">Stock Holds</h3><p className="text-xs text-amber-600">Click "Convert to Sale" to finalize a hold into an actual sale</p></div>
         <table className="min-w-full divide-y divide-amber-200">
-          <thead className="bg-amber-50">
-            <tr><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Customer</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">End Dest.</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Notes</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Actions</th></tr>
-          </thead>
+          <thead className="bg-amber-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Customer</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">End Dest.</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Notes</th><th className="px-4 py-3 text-left text-xs font-medium text-amber-700 uppercase">Actions</th></tr></thead>
           <tbody className="divide-y divide-amber-100">
             {filteredHolds.map(h => (
               <tr key={h.id}>
@@ -959,34 +1193,19 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
         {filteredHolds.length === 0 && <div className="text-center py-6 text-amber-600">No stock holds for {activeSize}</div>}
       </div>
 
-      {/* Samples/Stock Adjustments Section */}
       <div className="bg-orange-50 border border-orange-200 rounded-lg shadow overflow-hidden">
-        <div className="px-4 py-3 bg-orange-100 border-b border-orange-200">
-          <h3 className="font-semibold text-orange-800">Samples & Stock Adjustments</h3>
-          <p className="text-xs text-orange-600">Recorded at cost price - deducted from available stock</p>
-        </div>
+        <div className="px-4 py-3 bg-orange-100 border-b border-orange-200"><h3 className="font-semibold text-orange-800">Samples & Stock Adjustments</h3><p className="text-xs text-orange-600">Recorded at cost price - deducted from available stock</p></div>
         <table className="min-w-full divide-y divide-orange-200">
-          <thead className="bg-orange-50">
-            <tr>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Date</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Batch</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Reason</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Recipient</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Vials</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Cost Value</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Notes</th>
-              {isAdmin && <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Action</th>}
-            </tr>
-          </thead>
+          <thead className="bg-orange-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Batch</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Reason</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Recipient</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Cost Value</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Notes</th>{isAdmin && <th className="px-4 py-3 text-left text-xs font-medium text-orange-700 uppercase">Action</th>}</tr></thead>
           <tbody className="divide-y divide-orange-100">
             {filteredAdjustments.map(a => (
               <tr key={a.id} className="bg-orange-50/50">
-                <td className="px-4 py-3 text-sm text-orange-800">{new Date(a.adjustmentDate || a.date).toLocaleDateString()}<AuditTag createdBy={a.createdBy} createdAt={a.createdAt} /></td>
+                <td className="px-4 py-3 text-sm text-orange-800">{new Date(a.adjustmentDate || a.createdAt).toLocaleDateString()}<AuditTag createdBy={a.createdBy} createdAt={a.createdAt} /></td>
                 <td className="px-4 py-3 text-sm font-medium text-orange-700">{a.batchNumber}</td>
                 <td className="px-4 py-3 text-sm text-orange-600">{a.reason}</td>
                 <td className="px-4 py-3 text-sm text-orange-600">{a.recipient || '-'}</td>
-                <td className="px-4 py-3 text-sm text-orange-800">{a.vials} <span className="text-xs text-orange-500">({a.units?.toFixed(2)}pk)</span></td>
-                <td className="px-4 py-3 text-sm font-semibold text-orange-700">€{(a.totalCost || 0).toFixed(2)}</td>
+                <td className="px-4 py-3 text-sm text-orange-800">{a.vials} <span className="text-xs text-orange-500">({parseFloat(a.units)?.toFixed(2)}pk)</span></td>
+                <td className="px-4 py-3 text-sm font-semibold text-orange-700">€{(parseFloat(a.totalCost) || 0).toFixed(2)}</td>
                 <td className="px-4 py-3 text-sm text-orange-600">{a.notes || '-'}</td>
                 {isAdmin && <td className="px-4 py-3 text-sm"><button onClick={() => deleteStockAdjustment(a.id)} className="text-red-600 hover:text-red-800">Delete</button></td>}
               </tr>
@@ -996,106 +1215,33 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
         {filteredAdjustments.length === 0 && <div className="text-center py-6 text-orange-600">No samples recorded for {activeSize}</div>}
       </div>
 
-      {/* Convert Stock Hold to Sale Modal */}
       {showConvertModal && selectedHold && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-md mx-4">
             <h3 className="text-lg font-semibold text-gray-900 mb-4">Convert Stock Hold to Sale</h3>
-            
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4">
-              <p className="text-sm text-amber-800 font-medium">Stock Hold Details:</p>
-              <p className="text-sm text-amber-700">Customer: {selectedHold.customer}</p>
-              <p className="text-sm text-amber-700">End Destination: {selectedHold.endDestination || selectedHold.country}</p>
-              <p className="text-sm text-amber-700">Size: {selectedHold.size}</p>
-              <p className="text-sm text-amber-700">Vials: {selectedHold.vials} ({selectedHold.units} packs)</p>
-            </div>
-
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4"><p className="text-sm text-amber-800 font-medium">Stock Hold Details:</p><p className="text-sm text-amber-700">Customer: {selectedHold.customer}</p><p className="text-sm text-amber-700">End Destination: {selectedHold.endDestination || selectedHold.country}</p><p className="text-sm text-amber-700">Size: {selectedHold.size}</p><p className="text-sm text-amber-700">Vials: {selectedHold.vials} ({parseFloat(selectedHold.units).toFixed(2)} packs)</p></div>
             <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Sale Date</label>
-                <input type="date" value={convertForm.saleDate} onChange={(e) => setConvertForm({...convertForm, saleDate: e.target.value})} className="w-full border rounded-lg px-3 py-2" />
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Batch Number *</label>
-                <select value={convertForm.batchNumber} onChange={(e) => setConvertForm({...convertForm, batchNumber: e.target.value})} className="w-full border rounded-lg px-3 py-2">
-                  <option value="">Select batch...</option>
-                  {batches.map(b => <option key={b.batch} value={b.batch}>{b.batch} - {b.availableVials} vials available</option>)}
-                </select>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Price per Vial (€) *</label>
-                <input type="number" step="0.01" placeholder="0.00" value={convertForm.pricePerVial} onChange={(e) => setConvertForm({...convertForm, pricePerVial: e.target.value})} className="w-full border rounded-lg px-3 py-2" />
-                {convertForm.pricePerVial && selectedHold && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    Total: €{(parseFloat(convertForm.pricePerVial) * selectedHold.vials).toFixed(2)} 
-                    (€{(parseFloat(convertForm.pricePerVial) * VIALS_PER_PACK[selectedHold.size]).toFixed(2)} per pack)
-                  </p>
-                )}
-              </div>
-
-              <div className="border-t pt-4">
-                <label className="block text-sm font-medium text-red-700 mb-1">🔒 Enter Your Password to Confirm *</label>
-                <input type="password" placeholder="Your password" value={convertForm.password} onChange={(e) => setConvertForm({...convertForm, password: e.target.value})} className="w-full border border-red-300 rounded-lg px-3 py-2" />
-                <p className="text-xs text-gray-500 mt-1">Password required for security verification</p>
-              </div>
-
+              <div><label className="block text-sm font-medium text-gray-700 mb-1">Sale Date</label><input type="date" value={convertForm.saleDate} onChange={(e) => setConvertForm({...convertForm, saleDate: e.target.value})} className="w-full border rounded-lg px-3 py-2" /></div>
+              <div><label className="block text-sm font-medium text-gray-700 mb-1">Batch Number *</label><select value={convertForm.batchNumber} onChange={(e) => setConvertForm({...convertForm, batchNumber: e.target.value})} className="w-full border rounded-lg px-3 py-2"><option value="">Select batch...</option>{batches.map(b => <option key={b.batch} value={b.batch}>{b.batch} - {b.availableVials.toFixed(0)} vials available</option>)}</select></div>
+              <div><label className="block text-sm font-medium text-gray-700 mb-1">Price per Vial (€) *</label><input type="number" step="0.01" placeholder="0.00" value={convertForm.pricePerVial} onChange={(e) => setConvertForm({...convertForm, pricePerVial: e.target.value})} className="w-full border rounded-lg px-3 py-2" />{convertForm.pricePerVial && selectedHold && (<p className="text-xs text-gray-500 mt-1">Total: €{(parseFloat(convertForm.pricePerVial) * selectedHold.vials).toFixed(2)} (€{(parseFloat(convertForm.pricePerVial) * VIALS_PER_PACK[selectedHold.size]).toFixed(2)} per pack)</p>)}</div>
+              <div className="border-t pt-4"><label className="block text-sm font-medium text-red-700 mb-1">🔒 Enter Your Password to Confirm *</label><input type="password" placeholder="Your password" value={convertForm.password} onChange={(e) => setConvertForm({...convertForm, password: e.target.value})} className="w-full border border-red-300 rounded-lg px-3 py-2" /><p className="text-xs text-gray-500 mt-1">Password required for security verification</p></div>
               {modalError && <div className="bg-red-50 text-red-700 px-4 py-3 rounded-lg text-sm">{modalError}</div>}
-
-              <div className="flex gap-2 pt-2">
-                <button onClick={handleConvertToSale} disabled={modalLoading} className="flex-1 bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 disabled:opacity-50">
-                  {modalLoading ? 'Converting...' : 'Convert to Sale'}
-                </button>
-                <button onClick={() => { setShowConvertModal(false); setSelectedHold(null); }} className="flex-1 bg-gray-200 py-2 rounded-lg hover:bg-gray-300">
-                  Cancel
-                </button>
-              </div>
+              <div className="flex gap-2 pt-2"><button onClick={handleConvertToSale} disabled={modalLoading} className="flex-1 bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 disabled:opacity-50">{modalLoading ? 'Converting...' : 'Convert to Sale'}</button><button onClick={() => { setShowConvertModal(false); setSelectedHold(null); }} className="flex-1 bg-gray-200 py-2 rounded-lg hover:bg-gray-300">Cancel</button></div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Revert Sale to Stock Hold Modal (Admin Only) */}
       {showRevertModal && selectedSale && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-md mx-4">
             <h3 className="text-lg font-semibold text-orange-700 mb-4">⚠️ Revert Sale to Stock Hold</h3>
-            
-            <div className="bg-orange-50 border border-orange-200 rounded-lg p-4 mb-4">
-              <p className="text-sm text-orange-800 font-medium">This will:</p>
-              <ul className="text-sm text-orange-700 list-disc list-inside mt-2">
-                <li>Remove this sale record</li>
-                <li>Restore the stock hold</li>
-                <li>Update all inventory metrics</li>
-                <li>Update dashboard figures</li>
-              </ul>
-            </div>
-
-            <div className="bg-gray-50 border rounded-lg p-4 mb-4">
-              <p className="text-sm text-gray-800 font-medium">Sale Details:</p>
-              <p className="text-sm text-gray-700">Customer: {selectedSale.customer}</p>
-              <p className="text-sm text-gray-700">Batch: {selectedSale.batchNumber}</p>
-              <p className="text-sm text-gray-700">Amount: €{(selectedSale.units * selectedSale.price).toFixed(2)}</p>
-              <p className="text-sm text-gray-700">Converted by: {selectedSale.convertedBy || 'Unknown'}</p>
-            </div>
-
+            <div className="bg-orange-50 border border-orange-200 rounded-lg p-4 mb-4"><p className="text-sm text-orange-800 font-medium">This will:</p><ul className="text-sm text-orange-700 list-disc list-inside mt-2"><li>Remove this sale record</li><li>Restore the stock hold</li><li>Update all inventory metrics</li></ul></div>
+            <div className="bg-gray-50 border rounded-lg p-4 mb-4"><p className="text-sm text-gray-800 font-medium">Sale Details:</p><p className="text-sm text-gray-700">Customer: {selectedSale.customer}</p><p className="text-sm text-gray-700">Batch: {selectedSale.batchNumber}</p><p className="text-sm text-gray-700">Amount: €{(parseFloat(selectedSale.units) * parseFloat(selectedSale.price)).toFixed(2)}</p></div>
             <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-red-700 mb-1">🔒 Admin Password Required *</label>
-                <input type="password" placeholder="Enter admin password" value={revertPassword} onChange={(e) => setRevertPassword(e.target.value)} className="w-full border border-red-300 rounded-lg px-3 py-2" />
-              </div>
-
+              <div><label className="block text-sm font-medium text-red-700 mb-1">🔒 Admin Password Required *</label><input type="password" placeholder="Enter admin password" value={revertPassword} onChange={(e) => setRevertPassword(e.target.value)} className="w-full border border-red-300 rounded-lg px-3 py-2" /></div>
               {modalError && <div className="bg-red-50 text-red-700 px-4 py-3 rounded-lg text-sm">{modalError}</div>}
-
-              <div className="flex gap-2 pt-2">
-                <button onClick={handleRevertToHold} disabled={modalLoading} className="flex-1 bg-orange-600 text-white py-2 rounded-lg hover:bg-orange-700 disabled:opacity-50">
-                  {modalLoading ? 'Reverting...' : 'Revert to Hold'}
-                </button>
-                <button onClick={() => { setShowRevertModal(false); setSelectedSale(null); setRevertPassword(''); }} className="flex-1 bg-gray-200 py-2 rounded-lg hover:bg-gray-300">
-                  Cancel
-                </button>
-              </div>
+              <div className="flex gap-2 pt-2"><button onClick={handleRevertToHold} disabled={modalLoading} className="flex-1 bg-orange-600 text-white py-2 rounded-lg hover:bg-orange-700 disabled:opacity-50">{modalLoading ? 'Reverting...' : 'Revert to Hold'}</button><button onClick={() => { setShowRevertModal(false); setSelectedSale(null); setRevertPassword(''); }} className="flex-1 bg-gray-200 py-2 rounded-lg hover:bg-gray-300">Cancel</button></div>
             </div>
           </div>
         </div>
@@ -1104,22 +1250,23 @@ const Sales = ({ sales, addSale, deleteSale, stockHolds, addStockHold, deleteSto
   );
 };
 
+// ==================== PURCHASES COMPONENT ====================
 const Purchases = ({ purchases, addPurchase, deletePurchase, activeSize, setActiveSize, isAdmin, suppliers }) => {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ supplierId: '', supplier: '', batchNumber: '', expiryDate: '', vials: '', costPerVial: '', purchaseDate: new Date().toISOString().split('T')[0] });
 
   const handleSupplier = (id) => {
-    const s = suppliers.find(s => s.id === parseInt(id));
+    const s = suppliers.find(s => s.id === id);
     setForm({ ...form, supplierId: id, supplier: s ? s.name : '' });
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!form.supplier || !form.batchNumber || !form.expiryDate || !form.vials || !form.costPerVial) { alert('Fill all fields'); return; }
     const vials = parseFloat(form.vials);
     const vialsPerPack = VIALS_PER_PACK[activeSize];
     const packs = vials / vialsPerPack;
     const costPerPack = parseFloat(form.costPerVial) * vialsPerPack;
-    addPurchase({ ...form, size: activeSize, units: packs, cost: costPerPack });
+    await addPurchase({ ...form, size: activeSize, units: packs, cost: costPerPack });
     setForm({ supplierId: '', supplier: '', batchNumber: '', expiryDate: '', vials: '', costPerVial: '', purchaseDate: new Date().toISOString().split('T')[0] });
     setShowForm(false);
   };
@@ -1138,61 +1285,36 @@ const Purchases = ({ purchases, addPurchase, deletePurchase, activeSize, setActi
       {showForm && (
         <div className="bg-white rounded-lg shadow p-6 space-y-4">
           <h3 className="font-semibold">New Purchase - {activeSize} <span className="text-sm font-normal text-gray-500">({vialsPerPack} vials per pack)</span></h3>
-          <select value={form.supplierId} onChange={(e) => handleSupplier(e.target.value)} className="w-full border rounded-lg px-3 py-2">
-            <option value="">Select supplier...</option>
-            {suppliers.map(s => <option key={s.id} value={s.id}>{s.name} - {s.country}</option>)}
-          </select>
+          <select value={form.supplierId} onChange={(e) => handleSupplier(e.target.value)} className="w-full border rounded-lg px-3 py-2"><option value="">Select supplier...</option>{suppliers.map(s => <option key={s.id} value={s.id}>{s.name} - {s.country}</option>)}</select>
           <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Batch Number *</label>
-              <input type="text" placeholder="Enter batch number" value={form.batchNumber} onChange={(e) => setForm({...form, batchNumber: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Batch Expiry Date *</label>
-              <input type="date" value={form.expiryDate} onChange={(e) => setForm({...form, expiryDate: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-            </div>
+            <div><label className="block text-xs text-gray-500 mb-1">Batch Number *</label><input type="text" placeholder="Enter batch number" value={form.batchNumber} onChange={(e) => setForm({...form, batchNumber: e.target.value})} className="border rounded-lg px-3 py-2 w-full" /></div>
+            <div><label className="block text-xs text-gray-500 mb-1">Batch Expiry Date *</label><input type="date" value={form.expiryDate} onChange={(e) => setForm({...form, expiryDate: e.target.value})} className="border rounded-lg px-3 py-2 w-full" /></div>
           </div>
           <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Invoice Date *</label>
-              <input type="date" value={form.purchaseDate} onChange={(e) => setForm({...form, purchaseDate: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Number of Vials *</label>
-              <input type="number" placeholder="Enter vials" value={form.vials} onChange={(e) => setForm({...form, vials: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-              {form.vials && <p className="text-xs text-gray-500 mt-1">= {(parseFloat(form.vials) / vialsPerPack).toFixed(2)} packs</p>}
-            </div>
-            <div>
-              <label className="block text-xs text-gray-500 mb-1">Cost per Vial (€) *</label>
-              <input type="number" placeholder="0.00" step="0.01" value={form.costPerVial} onChange={(e) => setForm({...form, costPerVial: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-              {form.costPerVial && <p className="text-xs text-gray-500 mt-1">= €{(parseFloat(form.costPerVial) * vialsPerPack).toFixed(2)} per pack</p>}
-            </div>
+            <div><label className="block text-xs text-gray-500 mb-1">Invoice Date *</label><input type="date" value={form.purchaseDate} onChange={(e) => setForm({...form, purchaseDate: e.target.value})} className="border rounded-lg px-3 py-2 w-full" /></div>
+            <div><label className="block text-xs text-gray-500 mb-1">Number of Vials *</label><input type="number" placeholder="Enter vials" value={form.vials} onChange={(e) => setForm({...form, vials: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />{form.vials && <p className="text-xs text-gray-500 mt-1">= {(parseFloat(form.vials) / vialsPerPack).toFixed(2)} packs</p>}</div>
+            <div><label className="block text-xs text-gray-500 mb-1">Cost per Vial (€) *</label><input type="number" placeholder="0.00" step="0.01" value={form.costPerVial} onChange={(e) => setForm({...form, costPerVial: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />{form.costPerVial && <p className="text-xs text-gray-500 mt-1">= €{(parseFloat(form.costPerVial) * vialsPerPack).toFixed(2)} per pack</p>}</div>
           </div>
-          <div className="flex gap-2">
-            <button onClick={handleSubmit} className="bg-green-600 text-white px-4 py-2 rounded-lg">Save</button>
-            <button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div className="flex gap-2"><button onClick={handleSubmit} className="bg-green-600 text-white px-4 py-2 rounded-lg">Save</button><button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
       
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Supplier</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Batch</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expiry</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Packs</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total</th>{isAdmin && <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>}</tr>
-          </thead>
+          <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Supplier</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Batch</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expiry</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Packs</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Vials</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Total</th>{isAdmin && <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>}</tr></thead>
           <tbody className="divide-y divide-gray-200">
             {filtered.map(p => {
               const exp = p.expiryDate ? new Date(p.expiryDate) : null;
               const isExp = exp && exp < new Date();
               return (
                 <tr key={p.id} className={isExp ? 'bg-red-50' : ''}>
-                  <td className="px-4 py-3 text-sm">{new Date(p.purchaseDate || p.date).toLocaleDateString()}<AuditTag createdBy={p.createdBy} createdAt={p.createdAt} /></td>
+                  <td className="px-4 py-3 text-sm">{new Date(p.purchaseDate || p.createdAt).toLocaleDateString()}<AuditTag createdBy={p.createdBy} createdAt={p.createdAt} /></td>
                   <td className="px-4 py-3 text-sm font-medium">{p.supplier}</td>
                   <td className="px-4 py-3 text-sm text-green-600">{p.batchNumber}</td>
                   <td className="px-4 py-3 text-sm">{p.expiryDate ? <span className={isExp ? 'text-red-600 font-bold' : ''}>{new Date(p.expiryDate).toLocaleDateString()}{isExp && ' (EXPIRED)'}</span> : '-'}</td>
-                  <td className="px-4 py-3 text-sm">{p.units}</td>
-                  <td className="px-4 py-3 text-sm text-gray-500">{p.units * vialsPerPack}</td>
-                  <td className="px-4 py-3 text-sm font-semibold">€{(p.units * p.cost).toFixed(2)}</td>
+                  <td className="px-4 py-3 text-sm">{parseFloat(p.units).toFixed(2)}</td>
+                  <td className="px-4 py-3 text-sm text-gray-500">{(parseFloat(p.units) * vialsPerPack).toFixed(0)}</td>
+                  <td className="px-4 py-3 text-sm font-semibold">€{(parseFloat(p.units) * parseFloat(p.cost)).toFixed(2)}</td>
                   {isAdmin && <td className="px-4 py-3 text-sm"><button onClick={() => deletePurchase(p.id)} className="text-red-600">Delete</button></td>}
                 </tr>
               );
@@ -1205,17 +1327,18 @@ const Purchases = ({ purchases, addPurchase, deletePurchase, activeSize, setActi
   );
 };
 
+// ==================== PIPELINE COMPONENT ====================
 const Pipeline = ({ pipelinePurchases, addPipelinePurchase, deletePipelinePurchase, isAdmin, suppliers }) => {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ poNumber: '', supplier: '', size: '5ml', vials: '', pricePerVial: '', expectedDate: '', status: 'Ordered' });
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!form.poNumber || !form.supplier || !form.vials || !form.pricePerVial || !form.expectedDate) { alert('Fill all fields'); return; }
     const vials = parseFloat(form.vials);
     const vialsPerPack = VIALS_PER_PACK[form.size];
     const packs = vials / vialsPerPack;
     const pricePerPack = parseFloat(form.pricePerVial) * vialsPerPack;
-    addPipelinePurchase({ ...form, units: packs, price: pricePerPack, totalValue: packs * pricePerPack });
+    await addPipelinePurchase({ ...form, units: packs, price: pricePerPack, totalValue: packs * pricePerPack });
     setForm({ poNumber: '', supplier: '', size: '5ml', vials: '', pricePerVial: '', expectedDate: '', status: 'Ordered' });
     setShowForm(false);
   };
@@ -1232,44 +1355,32 @@ const Pipeline = ({ pipelinePurchases, addPipelinePurchase, deletePipelinePurcha
           <h3 className="font-semibold">New Pipeline Order</h3>
           <div className="grid grid-cols-2 gap-4">
             <input type="text" placeholder="PO Number" value={form.poNumber} onChange={(e) => setForm({...form, poNumber: e.target.value})} className="border rounded-lg px-3 py-2" />
-            <select value={form.supplier} onChange={(e) => setForm({...form, supplier: e.target.value})} className="border rounded-lg px-3 py-2">
-              <option value="">Select supplier...</option>
-              {suppliers.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
-            </select>
+            <select value={form.supplier} onChange={(e) => setForm({...form, supplier: e.target.value})} className="border rounded-lg px-3 py-2"><option value="">Select supplier...</option>{suppliers.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}</select>
           </div>
           <div className="grid grid-cols-3 gap-4">
-            <select value={form.size} onChange={(e) => setForm({...form, size: e.target.value})} className="border rounded-lg px-3 py-2">
-              {SIZES.map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
+            <select value={form.size} onChange={(e) => setForm({...form, size: e.target.value})} className="border rounded-lg px-3 py-2">{SIZES.map(s => <option key={s} value={s}>{s}</option>)}</select>
             <input type="number" placeholder="Number of Vials" value={form.vials} onChange={(e) => setForm({...form, vials: e.target.value})} className="border rounded-lg px-3 py-2" />
             <input type="number" placeholder="Price per vial €" step="0.01" value={form.pricePerVial} onChange={(e) => setForm({...form, pricePerVial: e.target.value})} className="border rounded-lg px-3 py-2" />
           </div>
           <div className="grid grid-cols-2 gap-4">
             <input type="date" value={form.expectedDate} onChange={(e) => setForm({...form, expectedDate: e.target.value})} className="border rounded-lg px-3 py-2" />
-            <select value={form.status} onChange={(e) => setForm({...form, status: e.target.value})} className="border rounded-lg px-3 py-2">
-              <option value="Ordered">Ordered</option><option value="In Transit">In Transit</option><option value="Delayed">Delayed</option><option value="Received">Received</option>
-            </select>
+            <select value={form.status} onChange={(e) => setForm({...form, status: e.target.value})} className="border rounded-lg px-3 py-2"><option value="Ordered">Ordered</option><option value="In Transit">In Transit</option><option value="Delayed">Delayed</option><option value="Received">Received</option></select>
           </div>
-          <div className="flex gap-2">
-            <button onClick={handleSubmit} className="bg-orange-600 text-white px-4 py-2 rounded-lg">Save</button>
-            <button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div className="flex gap-2"><button onClick={handleSubmit} className="bg-orange-600 text-white px-4 py-2 rounded-lg">Save</button><button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
       
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">PO #</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Supplier</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Size</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Packs</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expected</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>{isAdmin && <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>}</tr>
-          </thead>
+          <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">PO #</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Supplier</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Size</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Packs</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expected</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>{isAdmin && <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th>}</tr></thead>
           <tbody className="divide-y divide-gray-200">
             {pipelinePurchases.map(p => (
               <tr key={p.id} className={p.status === 'Delayed' ? 'bg-red-50' : ''}>
                 <td className="px-4 py-3 text-sm text-orange-600 font-mono">{p.poNumber}</td>
                 <td className="px-4 py-3 text-sm">{p.supplier}</td>
                 <td className="px-4 py-3 text-sm">{p.size}</td>
-                <td className="px-4 py-3 text-sm">{p.units}</td>
-                <td className="px-4 py-3 text-sm font-semibold">€{p.totalValue.toFixed(2)}</td>
+                <td className="px-4 py-3 text-sm">{parseFloat(p.units).toFixed(2)}</td>
+                <td className="px-4 py-3 text-sm font-semibold">€{parseFloat(p.totalValue).toFixed(2)}</td>
                 <td className="px-4 py-3 text-sm">{new Date(p.expectedDate).toLocaleDateString()}</td>
                 <td className="px-4 py-3 text-sm"><span className={`px-2 py-1 rounded text-xs ${p.status === 'Received' ? 'bg-green-100 text-green-800' : p.status === 'Delayed' ? 'bg-red-100 text-red-800' : 'bg-gray-100'}`}>{p.status}</span></td>
                 {isAdmin && <td className="px-4 py-3 text-sm"><button onClick={() => deletePipelinePurchase(p.id)} className="text-red-600">Delete</button></td>}
@@ -1283,18 +1394,15 @@ const Pipeline = ({ pipelinePurchases, addPipelinePurchase, deletePipelinePurcha
   );
 };
 
+// ==================== REPORTS COMPONENT ====================
 const Reports = ({ sales, purchases, stockAdjustments }) => {
   const [year, setYear] = useState('all');
   const [size, setSize] = useState('all');
 
-  const years = [...new Set([
-    ...sales.map(s => new Date(s.saleDate || s.date).getFullYear()),
-    ...purchases.map(p => new Date(p.purchaseDate || p.date).getFullYear()),
-    ...(stockAdjustments || []).map(a => new Date(a.adjustmentDate || a.date).getFullYear())
-  ])].sort((a, b) => b - a);
+  const years = [...new Set([...sales.map(s => new Date(s.saleDate || s.createdAt).getFullYear()), ...purchases.map(p => new Date(p.purchaseDate || p.createdAt).getFullYear()), ...(stockAdjustments || []).map(a => new Date(a.adjustmentDate || a.createdAt).getFullYear())])].filter(y => !isNaN(y)).sort((a, b) => b - a);
 
   const filterByYearAndSize = (items, dateField) => items.filter(item => {
-    const d = item[dateField] || item.date;
+    const d = item[dateField] || item.createdAt;
     const itemYear = d ? new Date(d).getFullYear() : null;
     return (year === 'all' || itemYear === parseInt(year)) && (size === 'all' || item.size === size);
   });
@@ -1303,144 +1411,34 @@ const Reports = ({ sales, purchases, stockAdjustments }) => {
   const filteredPurchases = filterByYearAndSize(purchases, 'purchaseDate');
   const filteredAdjustments = filterByYearAndSize(stockAdjustments || [], 'adjustmentDate');
   
-  const totalAdjustmentsVials = filteredAdjustments.reduce((sum, a) => sum + (parseFloat(a.vials) || 0), 0);
+  const totalSalesValue = filteredSales.reduce((sum, s) => sum + ((parseFloat(s.units) || 0) * (parseFloat(s.price) || 0)), 0);
+  const totalPurchasesValue = filteredPurchases.reduce((sum, p) => sum + ((parseFloat(p.units) || 0) * (parseFloat(p.cost) || 0)), 0);
   const totalAdjustmentsValue = filteredAdjustments.reduce((sum, a) => sum + (parseFloat(a.totalCost) || 0), 0);
-
-  const exportToCSV = (data, filename, headers, rowMapper) => {
-    const csvContent = [
-      headers.join(','),
-      ...data.map(item => rowMapper(item).map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','))
-    ].join('\n');
-    
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `${filename}_${year === 'all' ? 'all-years' : year}_${size === 'all' ? 'all-sizes' : size}.csv`;
-    link.click();
-  };
-
-  const exportSales = () => {
-    exportToCSV(
-      filteredSales,
-      'sales_report',
-      ['Date', 'Customer', 'Country', 'End Destination', 'Size', 'Batch', 'Packs', 'Vials', 'Price/Pack', 'Total'],
-      s => [
-        new Date(s.saleDate || s.date).toLocaleDateString(),
-        s.customer,
-        s.country || '',
-        s.endDestination || '',
-        s.size,
-        s.batchNumber || '',
-        s.units,
-        s.units * VIALS_PER_PACK[s.size],
-        s.price?.toFixed(2) || '',
-        (s.units * s.price).toFixed(2)
-      ]
-    );
-  };
-
-  const exportPurchases = () => {
-    exportToCSV(
-      filteredPurchases,
-      'purchases_report',
-      ['Date', 'Supplier', 'Size', 'Batch', 'Expiry', 'Packs', 'Vials', 'Cost/Pack', 'Total'],
-      p => [
-        new Date(p.purchaseDate || p.date).toLocaleDateString(),
-        p.supplier,
-        p.size,
-        p.batchNumber || '',
-        p.expiryDate ? new Date(p.expiryDate).toLocaleDateString() : '',
-        p.units,
-        p.units * VIALS_PER_PACK[p.size],
-        p.cost?.toFixed(2) || '',
-        (p.units * p.cost).toFixed(2)
-      ]
-    );
-  };
-
-  const exportSamples = () => {
-    exportToCSV(
-      filteredAdjustments,
-      'samples_report',
-      ['Date', 'Batch', 'Size', 'Reason', 'Recipient', 'Vials', 'Packs', 'Cost Value', 'Notes'],
-      a => [
-        new Date(a.adjustmentDate || a.date).toLocaleDateString(),
-        a.batchNumber || '',
-        a.size,
-        a.reason || '',
-        a.recipient || '',
-        a.vials,
-        a.units?.toFixed(2) || '',
-        (a.totalCost || 0).toFixed(2),
-        a.notes || ''
-      ]
-    );
-  };
-
-  const exportAll = () => {
-    exportSales();
-    setTimeout(() => exportPurchases(), 100);
-    setTimeout(() => exportSamples(), 200);
-  };
+  const totalAdjustmentsVials = filteredAdjustments.reduce((sum, a) => sum + (parseFloat(a.vials) || 0), 0);
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h2 className="text-xl font-semibold">Annual Reports</h2>
-        <button onClick={exportAll} className="flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-          Export All to CSV
-        </button>
-      </div>
-      
+      <h2 className="text-xl font-semibold">Annual Reports</h2>
       <div className="bg-white rounded-lg shadow p-4">
         <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Select Year</label>
-            <select value={year} onChange={(e) => setYear(e.target.value)} className="w-full border rounded-lg px-3 py-2">
-              <option value="all">All Years</option>
-              {years.map(y => <option key={y} value={y}>{y}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Product Size</label>
-            <select value={size} onChange={(e) => setSize(e.target.value)} className="w-full border rounded-lg px-3 py-2">
-              <option value="all">All Sizes</option>
-              {SIZES.map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </div>
+          <div><label className="block text-sm font-medium text-gray-700 mb-1">Select Year</label><select value={year} onChange={(e) => setYear(e.target.value)} className="w-full border rounded-lg px-3 py-2"><option value="all">All Years</option>{years.map(y => <option key={y} value={y}>{y}</option>)}</select></div>
+          <div><label className="block text-sm font-medium text-gray-700 mb-1">Product Size</label><select value={size} onChange={(e) => setSize(e.target.value)} className="w-full border rounded-lg px-3 py-2"><option value="all">All Sizes</option>{SIZES.map(s => <option key={s} value={s}>{s}</option>)}</select></div>
         </div>
       </div>
 
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg p-6 border-l-4 border-blue-500"><p className="text-sm font-medium text-blue-800">Total Revenue</p><p className="text-3xl font-bold text-blue-900">€{totalSalesValue.toFixed(2)}</p><p className="text-sm text-blue-600 mt-1">{filteredSales.length} sales</p></div>
+        <div className="bg-gradient-to-br from-green-50 to-green-100 rounded-lg p-6 border-l-4 border-green-500"><p className="text-sm font-medium text-green-800">Total Purchases</p><p className="text-3xl font-bold text-green-900">€{totalPurchasesValue.toFixed(2)}</p><p className="text-sm text-green-600 mt-1">{filteredPurchases.length} purchases</p></div>
+        <div className="bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg p-6 border-l-4 border-orange-500"><p className="text-sm font-medium text-orange-800">Total Samples (at cost)</p><p className="text-3xl font-bold text-orange-900">€{totalAdjustmentsValue.toFixed(2)}</p><p className="text-sm text-orange-600 mt-1">{filteredAdjustments.length} samples ({totalAdjustmentsVials} vials)</p></div>
+      </div>
+
       <div className="bg-white rounded-lg shadow">
-        <div className="px-6 py-4 border-b flex justify-between items-center">
-          <h3 className="text-lg font-semibold">Sales Report ({filteredSales.length} records)</h3>
-          <button onClick={exportSales} className="text-sm text-purple-600 hover:text-purple-800 flex items-center gap-1">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-            Export CSV
-          </button>
-        </div>
+        <div className="px-6 py-4 border-b"><h3 className="text-lg font-semibold">Sales Report ({filteredSales.length} records)</h3></div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-purple-50">
-              <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-purple-800 uppercase">Date</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-purple-800 uppercase">Customer</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-purple-800 uppercase">Size</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-purple-800 uppercase">Packs</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-purple-800 uppercase">Total</th>
-              </tr>
-            </thead>
+            <thead className="bg-purple-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-purple-800 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-purple-800 uppercase">Customer</th><th className="px-4 py-3 text-left text-xs font-medium text-purple-800 uppercase">Size</th><th className="px-4 py-3 text-right text-xs font-medium text-purple-800 uppercase">Packs</th><th className="px-4 py-3 text-right text-xs font-medium text-purple-800 uppercase">Total</th></tr></thead>
             <tbody className="divide-y divide-gray-200">
-              {filteredSales.map(s => (
-                <tr key={s.id} className="hover:bg-purple-50">
-                  <td className="px-4 py-3 text-sm">{new Date(s.saleDate || s.date).toLocaleDateString()}</td>
-                  <td className="px-4 py-3 text-sm font-medium">{s.customer}</td>
-                  <td className="px-4 py-3 text-sm">{s.size}</td>
-                  <td className="px-4 py-3 text-sm text-right">{s.units}</td>
-                  <td className="px-4 py-3 text-sm text-right font-semibold">€{(s.units * s.price).toFixed(2)}</td>
-                </tr>
-              ))}
+              {filteredSales.map(s => (<tr key={s.id} className="hover:bg-purple-50"><td className="px-4 py-3 text-sm">{new Date(s.saleDate || s.createdAt).toLocaleDateString()}</td><td className="px-4 py-3 text-sm font-medium">{s.customer}</td><td className="px-4 py-3 text-sm">{s.size}</td><td className="px-4 py-3 text-sm text-right">{parseFloat(s.units).toFixed(2)}</td><td className="px-4 py-3 text-sm text-right font-semibold">€{(parseFloat(s.units) * parseFloat(s.price)).toFixed(2)}</td></tr>))}
             </tbody>
           </table>
           {filteredSales.length === 0 && <div className="text-center py-8 text-gray-500">No sales data found</div>}
@@ -1448,36 +1446,12 @@ const Reports = ({ sales, purchases, stockAdjustments }) => {
       </div>
 
       <div className="bg-white rounded-lg shadow">
-        <div className="px-6 py-4 border-b flex justify-between items-center">
-          <h3 className="text-lg font-semibold">Purchases Report ({filteredPurchases.length} records)</h3>
-          <button onClick={exportPurchases} className="text-sm text-green-600 hover:text-green-800 flex items-center gap-1">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-            Export CSV
-          </button>
-        </div>
+        <div className="px-6 py-4 border-b"><h3 className="text-lg font-semibold">Purchases Report ({filteredPurchases.length} records)</h3></div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-green-50">
-              <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Date</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Supplier</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Size</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Batch</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-green-800 uppercase">Packs</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-green-800 uppercase">Total</th>
-              </tr>
-            </thead>
+            <thead className="bg-green-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Supplier</th><th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Size</th><th className="px-4 py-3 text-left text-xs font-medium text-green-800 uppercase">Batch</th><th className="px-4 py-3 text-right text-xs font-medium text-green-800 uppercase">Packs</th><th className="px-4 py-3 text-right text-xs font-medium text-green-800 uppercase">Total</th></tr></thead>
             <tbody className="divide-y divide-gray-200">
-              {filteredPurchases.map(p => (
-                <tr key={p.id} className="hover:bg-green-50">
-                  <td className="px-4 py-3 text-sm">{new Date(p.purchaseDate || p.date).toLocaleDateString()}</td>
-                  <td className="px-4 py-3 text-sm font-medium">{p.supplier}</td>
-                  <td className="px-4 py-3 text-sm">{p.size}</td>
-                  <td className="px-4 py-3 text-sm text-green-600">{p.batchNumber}</td>
-                  <td className="px-4 py-3 text-sm text-right">{p.units}</td>
-                  <td className="px-4 py-3 text-sm text-right font-semibold">€{(p.units * p.cost).toFixed(2)}</td>
-                </tr>
-              ))}
+              {filteredPurchases.map(p => (<tr key={p.id} className="hover:bg-green-50"><td className="px-4 py-3 text-sm">{new Date(p.purchaseDate || p.createdAt).toLocaleDateString()}</td><td className="px-4 py-3 text-sm font-medium">{p.supplier}</td><td className="px-4 py-3 text-sm">{p.size}</td><td className="px-4 py-3 text-sm text-green-600">{p.batchNumber}</td><td className="px-4 py-3 text-sm text-right">{parseFloat(p.units).toFixed(2)}</td><td className="px-4 py-3 text-sm text-right font-semibold">€{(parseFloat(p.units) * parseFloat(p.cost)).toFixed(2)}</td></tr>))}
             </tbody>
           </table>
           {filteredPurchases.length === 0 && <div className="text-center py-8 text-gray-500">No purchases data found</div>}
@@ -1485,45 +1459,13 @@ const Reports = ({ sales, purchases, stockAdjustments }) => {
       </div>
 
       <div className="bg-white rounded-lg shadow">
-        <div className="px-6 py-4 border-b flex justify-between items-center">
-          <h3 className="text-lg font-semibold text-orange-800">Samples & Stock Adjustments Report ({filteredAdjustments.length} records)</h3>
-          <button onClick={exportSamples} className="text-sm text-orange-600 hover:text-orange-800 flex items-center gap-1">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-            Export CSV
-          </button>
-        </div>
+        <div className="px-6 py-4 border-b"><h3 className="text-lg font-semibold text-orange-800">Samples & Stock Adjustments Report ({filteredAdjustments.length} records)</h3></div>
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-orange-50">
-              <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Date</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Batch</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Size</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Reason</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Recipient</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-orange-800 uppercase">Vials</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-orange-800 uppercase">Cost Value</th>
-              </tr>
-            </thead>
+            <thead className="bg-orange-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Date</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Batch</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Size</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Reason</th><th className="px-4 py-3 text-left text-xs font-medium text-orange-800 uppercase">Recipient</th><th className="px-4 py-3 text-right text-xs font-medium text-orange-800 uppercase">Vials</th><th className="px-4 py-3 text-right text-xs font-medium text-orange-800 uppercase">Cost Value</th></tr></thead>
             <tbody className="divide-y divide-gray-200">
-              {filteredAdjustments.map(a => (
-                <tr key={a.id} className="hover:bg-orange-50">
-                  <td className="px-4 py-3 text-sm">{new Date(a.adjustmentDate || a.date).toLocaleDateString()}</td>
-                  <td className="px-4 py-3 text-sm font-medium text-orange-600">{a.batchNumber}</td>
-                  <td className="px-4 py-3 text-sm">{a.size}</td>
-                  <td className="px-4 py-3 text-sm">{a.reason}</td>
-                  <td className="px-4 py-3 text-sm">{a.recipient || '-'}</td>
-                  <td className="px-4 py-3 text-sm text-right">{a.vials}</td>
-                  <td className="px-4 py-3 text-sm text-right font-semibold">€{(a.totalCost || 0).toFixed(2)}</td>
-                </tr>
-              ))}
-              {filteredAdjustments.length > 0 && (
-                <tr className="bg-orange-100 font-bold">
-                  <td colSpan="5" className="px-4 py-3 text-sm text-orange-900">TOTAL SAMPLES</td>
-                  <td className="px-4 py-3 text-sm text-right text-orange-900">{totalAdjustmentsVials}</td>
-                  <td className="px-4 py-3 text-sm text-right text-orange-900">€{totalAdjustmentsValue.toFixed(2)}</td>
-                </tr>
-              )}
+              {filteredAdjustments.map(a => (<tr key={a.id} className="hover:bg-orange-50"><td className="px-4 py-3 text-sm">{new Date(a.adjustmentDate || a.createdAt).toLocaleDateString()}</td><td className="px-4 py-3 text-sm font-medium text-orange-600">{a.batchNumber}</td><td className="px-4 py-3 text-sm">{a.size}</td><td className="px-4 py-3 text-sm">{a.reason}</td><td className="px-4 py-3 text-sm">{a.recipient || '-'}</td><td className="px-4 py-3 text-sm text-right">{a.vials}</td><td className="px-4 py-3 text-sm text-right font-semibold">€{(parseFloat(a.totalCost) || 0).toFixed(2)}</td></tr>))}
+              {filteredAdjustments.length > 0 && (<tr className="bg-orange-100 font-bold"><td colSpan="5" className="px-4 py-3 text-sm text-orange-900">TOTAL SAMPLES</td><td className="px-4 py-3 text-sm text-right text-orange-900">{totalAdjustmentsVials}</td><td className="px-4 py-3 text-sm text-right text-orange-900">€{totalAdjustmentsValue.toFixed(2)}</td></tr>)}
             </tbody>
           </table>
           {filteredAdjustments.length === 0 && <div className="text-center py-8 text-gray-500">No samples/adjustments data found</div>}
@@ -1533,76 +1475,13 @@ const Reports = ({ sales, purchases, stockAdjustments }) => {
   );
 };
 
-const Setup = ({ customers, addCustomer, deleteCustomer, suppliers, addSupplier, deleteSupplier, onDataRestore }) => {
+// ==================== SETUP COMPONENT ====================
+const Setup = ({ customers, addCustomer, deleteCustomer, suppliers, addSupplier, deleteSupplier }) => {
   const [tab, setTab] = useState('customers');
-
-  const handleBackup = async () => {
-    try {
-      const backupData = {};
-      const keys = ['sales-data', 'purchases-data', 'customers-data', 'suppliers-data', 'pipeline-purchases-data', 'stock-holds-data', 'stock-adjustments-data', 'users'];
-      
-      for (const key of keys) {
-        const data = await storage.get(key);
-        if (data) backupData[key] = JSON.parse(data.value);
-      }
-      
-      const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
-      const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
-      link.download = `eurofolic_backup_${new Date().toISOString().split('T')[0]}.json`;
-      link.click();
-      alert('Backup downloaded successfully!');
-    } catch (e) {
-      alert('Backup failed: ' + e.message);
-    }
-  };
-
-  const handleRestore = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-    
-    if (!confirm('This will replace ALL current data. Are you sure you want to restore from this backup?')) {
-      event.target.value = '';
-      return;
-    }
-    
-    try {
-      const text = await file.text();
-      const backupData = JSON.parse(text);
-      
-      for (const [key, value] of Object.entries(backupData)) {
-        await storage.set(key, JSON.stringify(value));
-      }
-      
-      alert('Data restored successfully! The page will now reload.');
-      event.target.value = '';
-      if (onDataRestore) onDataRestore();
-      window.location.reload();
-    } catch (e) {
-      alert('Restore failed: ' + e.message);
-      event.target.value = '';
-    }
-  };
-
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-center">
-        <h2 className="text-xl font-semibold">Setup</h2>
-        <div className="flex gap-2">
-          <button onClick={handleBackup} className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-            Backup Data
-          </button>
-          <label className="flex items-center gap-2 bg-orange-500 text-white px-4 py-2 rounded-lg hover:bg-orange-600 cursor-pointer">
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-            Restore Data
-            <input type="file" accept=".json" onChange={handleRestore} className="hidden" />
-          </label>
-        </div>
-      </div>
-      <div className="flex space-x-2 border-b">
-        {['customers', 'suppliers', 'users'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm capitalize ${tab === t ? 'border-b-2 border-indigo-500 text-indigo-600' : 'text-gray-600'}`}>{t}</button>))}
-      </div>
+      <h2 className="text-xl font-semibold">Setup</h2>
+      <div className="flex space-x-2 border-b">{['customers', 'suppliers', 'users'].map(t => (<button key={t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm capitalize ${tab === t ? 'border-b-2 border-indigo-500 text-indigo-600' : 'text-gray-600'}`}>{t}</button>))}</div>
       {tab === 'customers' && <Customers customers={customers} addCustomer={addCustomer} deleteCustomer={deleteCustomer} />}
       {tab === 'suppliers' && <Suppliers suppliers={suppliers} addSupplier={addSupplier} deleteSupplier={deleteSupplier} />}
       {tab === 'users' && <Users />}
@@ -1614,9 +1493,9 @@ const Customers = ({ customers, addCustomer, deleteCustomer }) => {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', country: '', contactPerson: '', email: '', phone: '' });
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!form.name || !form.country || !form.email) { alert('Name, country and email required'); return; }
-    addCustomer(form);
+    await addCustomer(form);
     setForm({ name: '', country: '', contactPerson: '', email: '', phone: '' });
     setShowForm(false);
   };
@@ -1628,28 +1507,16 @@ const Customers = ({ customers, addCustomer, deleteCustomer }) => {
         <div className="bg-white rounded-lg shadow p-6 space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <input type="text" placeholder="Name *" value={form.name} onChange={(e) => setForm({...form, name: e.target.value})} className="border rounded-lg px-3 py-2" />
-            <input type="text" placeholder="Country *" value={form.country} onChange={(e) => setForm({...form, country: e.target.value})} className="border rounded-lg px-3 py-2" />
+            <select value={form.country} onChange={(e) => setForm({...form, country: e.target.value})} className="border rounded-lg px-3 py-2"><option value="">Select country *</option>{COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}</select>
           </div>
           <input type="email" placeholder="Email *" value={form.email} onChange={(e) => setForm({...form, email: e.target.value})} className="border rounded-lg px-3 py-2 w-full" />
-          <div className="flex gap-2">
-            <button onClick={handleSubmit} className="bg-blue-600 text-white px-4 py-2 rounded-lg">Save</button>
-            <button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div className="flex gap-2"><button onClick={handleSubmit} className="bg-blue-600 text-white px-4 py-2 rounded-lg">Save</button><button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Country</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Email</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th></tr></thead>
-          <tbody className="divide-y divide-gray-200">
-            {customers.map(c => (
-              <tr key={c.id}>
-                <td className="px-4 py-3 text-sm font-medium">{c.name}</td>
-                <td className="px-4 py-3 text-sm">{c.country}</td>
-                <td className="px-4 py-3 text-sm">{c.email}</td>
-                <td className="px-4 py-3 text-sm"><button onClick={() => deleteCustomer(c.id)} className="text-red-600">Delete</button></td>
-              </tr>
-            ))}
-          </tbody>
+          <tbody className="divide-y divide-gray-200">{customers.map(c => (<tr key={c.id}><td className="px-4 py-3 text-sm font-medium">{c.name}</td><td className="px-4 py-3 text-sm">{c.country}</td><td className="px-4 py-3 text-sm">{c.email}</td><td className="px-4 py-3 text-sm"><button onClick={() => deleteCustomer(c.id)} className="text-red-600">Delete</button></td></tr>))}</tbody>
         </table>
         {customers.length === 0 && <div className="text-center py-8 text-gray-500">No customers</div>}
       </div>
@@ -1661,9 +1528,9 @@ const Suppliers = ({ suppliers, addSupplier, deleteSupplier }) => {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ name: '', country: '', email: '', phone: '' });
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (!form.name || !form.country) { alert('Name and country required'); return; }
-    addSupplier(form);
+    await addSupplier(form);
     setForm({ name: '', country: '', email: '', phone: '' });
     setShowForm(false);
   };
@@ -1675,26 +1542,15 @@ const Suppliers = ({ suppliers, addSupplier, deleteSupplier }) => {
         <div className="bg-white rounded-lg shadow p-6 space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <input type="text" placeholder="Name *" value={form.name} onChange={(e) => setForm({...form, name: e.target.value})} className="border rounded-lg px-3 py-2" />
-            <input type="text" placeholder="Country *" value={form.country} onChange={(e) => setForm({...form, country: e.target.value})} className="border rounded-lg px-3 py-2" />
+            <select value={form.country} onChange={(e) => setForm({...form, country: e.target.value})} className="border rounded-lg px-3 py-2"><option value="">Select country *</option>{COUNTRIES.map(c => <option key={c} value={c}>{c}</option>)}</select>
           </div>
-          <div className="flex gap-2">
-            <button onClick={handleSubmit} className="bg-green-600 text-white px-4 py-2 rounded-lg">Save</button>
-            <button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div className="flex gap-2"><button onClick={handleSubmit} className="bg-green-600 text-white px-4 py-2 rounded-lg">Save</button><button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Country</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th></tr></thead>
-          <tbody className="divide-y divide-gray-200">
-            {suppliers.map(s => (
-              <tr key={s.id}>
-                <td className="px-4 py-3 text-sm font-medium">{s.name}</td>
-                <td className="px-4 py-3 text-sm">{s.country}</td>
-                <td className="px-4 py-3 text-sm"><button onClick={() => deleteSupplier(s.id)} className="text-red-600">Delete</button></td>
-              </tr>
-            ))}
-          </tbody>
+          <tbody className="divide-y divide-gray-200">{suppliers.map(s => (<tr key={s.id}><td className="px-4 py-3 text-sm font-medium">{s.name}</td><td className="px-4 py-3 text-sm">{s.country}</td><td className="px-4 py-3 text-sm"><button onClick={() => deleteSupplier(s.id)} className="text-red-600">Delete</button></td></tr>))}</tbody>
         </table>
         {suppliers.length === 0 && <div className="text-center py-8 text-gray-500">No suppliers</div>}
       </div>
@@ -1706,30 +1562,46 @@ const Users = () => {
   const [users, setUsers] = useState([]);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ username: '', password: '', name: '', initials: '', role: 'user' });
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => { loadUsers(); }, []);
 
   const loadUsers = async () => {
     try {
-      const data = await storage.get('users');
-      if (data) setUsers(JSON.parse(data.value));
-    } catch (e) {}
+      const { data, error } = await supabase.from('users').select('*').order('username');
+      if (!error && data) setUsers(data);
+    } catch (e) { console.error('Load users error:', e); }
+    setLoading(false);
   };
 
   const addUser = async () => {
     if (!form.username || !form.password || !form.name) { alert('Fill all fields'); return; }
-    const newUsers = [...users, { ...form, initials: form.initials || form.username.substring(0,3).toUpperCase(), id: Date.now() }];
-    setUsers(newUsers);
-    await storage.set('users', JSON.stringify(newUsers));
-    setForm({ username: '', password: '', name: '', initials: '', role: 'user' });
-    setShowForm(false);
+    try {
+      const { data, error } = await supabase.from('users').insert([{
+        username: form.username,
+        password: form.password,
+        name: form.name,
+        initials: form.initials || form.username.substring(0, 3).toUpperCase(),
+        role: form.role
+      }]).select().single();
+      if (error) throw error;
+      setUsers([...users, data].sort((a, b) => a.username.localeCompare(b.username)));
+      setForm({ username: '', password: '', name: '', initials: '', role: 'user' });
+      setShowForm(false);
+    } catch (e) { console.error('Add user error:', e); alert('Failed to add user: ' + e.message); }
   };
 
   const deleteUser = async (id) => {
-    const newUsers = users.filter(u => u.id !== id && u.username !== 'admin');
-    setUsers(newUsers);
-    await storage.set('users', JSON.stringify(newUsers));
+    const user = users.find(u => u.id === id);
+    if (user?.username === 'admin') { alert('Cannot delete admin user'); return; }
+    try {
+      const { error } = await supabase.from('users').delete().eq('id', id);
+      if (error) throw error;
+      setUsers(users.filter(u => u.id !== id));
+    } catch (e) { console.error('Delete user error:', e); }
   };
+
+  if (loading) return <div className="text-center py-8">Loading users...</div>;
 
   return (
     <div className="space-y-4">
@@ -1742,22 +1614,15 @@ const Users = () => {
           </div>
           <div className="grid grid-cols-2 gap-4">
             <input type="password" placeholder="Password" value={form.password} onChange={(e) => setForm({...form, password: e.target.value})} className="border rounded-lg px-3 py-2" />
-            <select value={form.role} onChange={(e) => setForm({...form, role: e.target.value})} className="border rounded-lg px-3 py-2">
-              <option value="user">User</option><option value="admin">Admin</option>
-            </select>
+            <select value={form.role} onChange={(e) => setForm({...form, role: e.target.value})} className="border rounded-lg px-3 py-2"><option value="user">User</option><option value="admin">Admin</option></select>
           </div>
-          <div className="flex gap-2">
-            <button onClick={addUser} className="bg-indigo-600 text-white px-4 py-2 rounded-lg">Save</button>
-            <button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button>
-          </div>
+          <div className="flex gap-2"><button onClick={addUser} className="bg-indigo-600 text-white px-4 py-2 rounded-lg">Save</button><button onClick={() => setShowForm(false)} className="bg-gray-200 px-4 py-2 rounded-lg">Cancel</button></div>
         </div>
       )}
       <div className="bg-white rounded-lg shadow overflow-hidden">
         <table className="min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Username</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Role</th><th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Action</th></tr></thead>
-          <tbody className="divide-y divide-gray-200">
-            {users.map(u => (<tr key={u.id || u.username}><td className="px-4 py-3 text-sm font-medium">{u.username}</td><td className="px-4 py-3 text-sm">{u.name}</td><td className="px-4 py-3 text-sm"><span className={`px-2 py-1 rounded text-xs ${u.role === 'admin' ? 'bg-purple-100 text-purple-800' : 'bg-gray-100'}`}>{u.role}</span></td><td className="px-4 py-3 text-sm">{u.username !== 'admin' && <button onClick={() => deleteUser(u.id)} className="text-red-600">Delete</button>}</td></tr>))}
-          </tbody>
+          <tbody className="divide-y divide-gray-200">{users.map(u => (<tr key={u.id}><td className="px-4 py-3 text-sm font-medium">{u.username}</td><td className="px-4 py-3 text-sm">{u.name}</td><td className="px-4 py-3 text-sm"><span className={`px-2 py-1 rounded text-xs ${u.role === 'admin' ? 'bg-purple-100 text-purple-800' : 'bg-gray-100'}`}>{u.role}</span></td><td className="px-4 py-3 text-sm">{u.username !== 'admin' && <button onClick={() => deleteUser(u.id)} className="text-red-600">Delete</button>}</td></tr>))}</tbody>
         </table>
       </div>
     </div>
